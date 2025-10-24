@@ -1,0 +1,941 @@
+---
+title: "Mapping dominant vegetation regeneration types across Yosemite National Park after high-severity fire"
+author: "Hannah Redford"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "70%", fig.align = "center", time_it = TRUE, dpi = 75)
+options(kableExtra.latex.load_packages = FALSE)
+#knitr::opts_knit$set(root.dir = 'U:/SEFS_ESRM_533_433/')
+knitr::opts_knit$set(root.dir = "G:\\REGEN")
+# knitr::opts_knit$set(root.dir = 'C:/Users/ajs0428/OneDrive - UW/University of Washington/Teaching/SEFS433_Lidar/Labs/')
+  library(lidRplugins)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(glmnet)
+  library(MuMIn)
+  library(Rcpp)
+  library(furrr)
+  library(dplyr)
+  library(parallel)
+  library(future)
+  library(yardstick)
+  library(caret)
+  library(corrplot)
+  library(ordinalNet)
+  library(kableExtra)
+  library(betareg)
+
+rm(list = ls())
+```
+
+
+```{r remove-correlation, echo=FALSE}
+#------------------------------------------------------------------------------
+# Remove correlated variables
+
+csv = read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+csv = csv[, !grepl("propor", names(csv))]
+csv = csv[, !grepl("b1", names(csv))]
+csv = csv[, !grepl("b10", names(csv))]
+
+cor_matrix <- cor(csv[c(8:length(csv))])  # X = predictor matrix (no response var)
+# corrplot(cor_matrix,
+#          method = "color",       # use color shading
+#          type = "upper",         # show only upper triangle
+#          order = "hclust",       # hierarchical clustering order
+#          addCoef.col = "black",  # add correlation coefficients
+#          tl.col = "black",       # text label color
+#          tl.cex = 0.8,           # text label size
+#          number.cex = 0.7,       # correlation number size
+#          diag = FALSE)  
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7)
+noncor_vars <- csv[, -drop_idx]  # keep only uncorrelated predictors
+noncor_names = colnames(noncor_vars[,-1])
+```
+
+```{r, load-conifer-data, echo= FALSE}
+
+coniferDF = as.data.frame(csv[,6])
+coniferDF = cbind(coniferDF, noncor_vars[,-1])
+
+colnames(coniferDF)[1] = "y"
+coniferDF$y[coniferDF$y > 0] = 1
+coniferDF$y[coniferDF$y < 1] = 0
+
+coniferDF$success = coniferDF$y
+coniferDF = coniferDF[,-1]
+coniferDF$success = as.numeric(coniferDF$success)
+# coniferDF$plot_id = 1:length(coniferDF[,1])
+# n_plots = length(coniferDF[,1])
+
+#head(coniferDF)
+
+```
+
+```{r, load-oak-data, echo= FALSE}
+
+oakDF = as.data.frame(csv[,5])
+oakDF = cbind(oakDF, noncor_vars[,-1])
+
+
+colnames(oakDF)[1] = "y"
+oakDF$y[oakDF$y > 0] = 1
+oakDF$y[oakDF$y < 1] = 0
+
+oakDF$success = oakDF$y
+oakDF = oakDF[,-1]
+oakDF$success = as.numeric(oakDF$success)
+# oakDF$plot_id = 1:length(oakDF[,1])
+# n_plots = length(oakDF[,1])
+
+#head(oakDF)
+
+```
+  
+```{r, load-shrub-data, echo= FALSE}
+
+shrubDF = as.data.frame(csv[,7])
+shrubDF = cbind(shrubDF, noncor_vars[,-1])
+
+
+colnames(shrubDF)[1] = "y"
+shrubDF$y[shrubDF$y > 0.001] = 1
+shrubDF$y[shrubDF$y < 0.001] = 0
+
+shrubDF$success = shrubDF$y
+shrubDF = shrubDF[,-1]
+shrubDF$success = as.numeric(shrubDF$success)
+# shrubDF$plot_id = 1:length(shrubDF[,1])
+# n_plots = length(shrubDF[,1])
+
+#head(shrubDF)
+
+```
+
+```{r AIC-function, echo = FALSE, warning=FALSE}
+
+find_best_logistic_model <- function(data, response_var, max_predictors = 6) {
+  all_vars <- setdiff(names(data), response_var)
+  best_aic <- Inf
+  best_model <- NULL
+  best_formula <- NULL
+  
+  total_models <- sum(sapply(1:max_predictors, function(k) choose(length(all_vars), k)))
+  #pb <- txtProgressBar(min = 0, max = total_models, style = 3)
+  #counter <- 0
+  
+  for (k in 1:max_predictors) {
+    combos <- combn(all_vars, k, simplify = FALSE)
+    
+    for (vars in combos) {
+      #counter <- counter + 1
+      #setTxtProgressBar(pb, counter)
+      
+      formula_str <- paste(response_var, "~", paste(vars, collapse = " + "))
+      model <- tryCatch(
+        glm(as.formula(formula_str), data = data, family = binomial),
+        error = function(e) NULL
+      )
+      
+      if (!is.null(model)) {
+        current_aic <- AIC(model)
+        if (!is.na(current_aic) && current_aic < best_aic) {
+          best_aic <- current_aic
+          best_model <- model
+          best_formula <- formula_str
+        }
+      }
+    }
+  }
+  
+  #close(pb)
+  
+  return(list(
+    best_model = best_model,
+    best_formula = best_formula,
+    best_aic = best_aic
+  ))
+}
+
+```
+
+```{r conifer-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+# run the function for conifers
+con_result <- find_best_logistic_model(data = coniferDF, response_var = "success")
+
+saveRDS(con_result, file = "Plot_Level_Products\\Models\\con_result.rds")
+
+```
+
+```{r oak-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+# run the function for conifers
+oak_result <- find_best_logistic_model(data = oakDF, response_var = "success")
+
+saveRDS(oak_result, file = "Plot_Level_Products\\Models\\oak_result.rds")
+
+```
+
+```{r shrub-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+# run the function for conifers
+shrub_result <- find_best_logistic_model(data = shrubDF, response_var = "success")
+
+saveRDS(shrub_result, file = "Plot_Level_Products\\Models\\shr_result.rds")
+
+```
+
+```{r var-results, echo=FALSE}
+
+con_result <- readRDS("G:\\REGEN\\Plot_Level_Products\\Models\\con_result.rds")
+oak_result <- readRDS("G:\\REGEN\\Plot_Level_Products\\Models\\oak_result.rds")
+shr_result <- readRDS("G:\\REGEN\\Plot_Level_Products\\Models\\shr_result.rds")
+
+
+# View results
+cat("Best formula Conifer Model:", con_result$best_formula, "\n")
+cat("Best AIC Conifer Model:", con_result$best_aic, "\n")
+#summary(result$best_model)
+
+cat("Best formula Oak Model:", oak_result$best_formula, "\n")
+cat("Best AIC Oak Model:", oak_result$best_aic, "\n")
+
+# View results
+cat("Best formula Shrub Model:", shr_result$best_formula, "\n")
+cat("Best AIC Shrub Model:", shr_result$best_aic, "\n")
+
+```
+```{r con-test, echo = FALSE, warning=FALSE}
+
+regen = coniferDF
+
+truepos = 0
+trueneg = 0
+falspos = 0
+falsneg = 0
+
+for (i in c(1:length(regen[,1]))) {
+  
+  df = regen[-c(i),]
+  glmmodel = glm(formula(oak_result$best_formula), data = df, family = binomial)
+  
+  pred = predict(glmmodel, regen[i,], type = 'response')
+  #print(pred)
+  
+  if (pred > 0.5) {
+    if (regen$success[i] == 1) {
+      truepos = truepos +1
+    } else{
+      falspos = falspos +1
+    }
+  } 
+  
+  if (pred <=  0.5) {
+    if (regen$success[i] == 1) {
+      falsneg = falsneg +1
+    } else {
+      trueneg = trueneg + 1
+    }
+  }
+}
+
+
+precision = truepos/(truepos+falspos)
+recall = truepos/(truepos+falsneg)
+regen_fscore = 2*(precision*recall)/ (precision+recall)
+
+#summary(glmmodel)
+```
+
+```{r oak-test, echo = FALSE, warning=FALSE}
+
+regen = oakDF
+
+truepos = 0
+trueneg = 0
+falspos = 0
+falsneg = 0
+
+for (i in c(1:length(regen[,1]))) {
+  
+  df = regen[-c(i),]
+  glmmodel = glm(formula(oak_result$best_formula), data = df, family = binomial)
+  
+  pred = predict(glmmodel, regen[i,], type = 'response')
+  #print(pred)
+  
+  if (pred > 0.5) {
+    if (regen$success[i] == 1) {
+      truepos = truepos +1
+    } else{
+      falspos = falspos +1
+    }
+  } 
+  
+  if (pred <=  0.5) {
+    if (regen$success[i] == 1) {
+      falsneg = falsneg +1
+    } else {
+      trueneg = trueneg + 1
+    }
+  }
+}
+
+precision = truepos/(truepos+falspos)
+recall = truepos/(truepos+falsneg)
+oak_fscore = 2*(precision*recall)/ (precision+recall)
+
+#summary(glmmodel)
+
+```
+
+
+```{r shrub-test, echo = FALSE, warning=FALSE}
+
+regen = shrubDF
+
+truepos = 0
+trueneg = 0
+falspos = 0
+falsneg = 0
+
+
+
+for (i in c(1:length(regen[,1]))) {
+  
+  df = regen[-c(i),]
+  glmmodel = glm(formula(oak_result$best_formula), data = df, family = binomial)
+  
+  pred = predict(glmmodel, regen[i,], type = 'response')
+  #print(pred)
+  
+  if (pred > 0.7) {
+    if (regen$success[i] == 1) {
+      truepos = truepos +1
+    } else{
+      falspos = falspos +1
+    }
+  } 
+  
+  if (pred <=  0.7) {
+    if (regen$success[i] == 1) {
+      falsneg = falsneg +1
+    } else {
+      trueneg = trueneg + 1
+    }
+  }
+}
+
+precision = truepos/(truepos+falspos)
+recall = truepos/(truepos+falsneg)
+shrub_fscore = 2*(precision*recall)/ (precision+recall)
+
+#summary(glmmodel)
+
+```
+
+
+```{r print-fscores, echo = FALSE}
+
+cat("Conifer F-score:", regen_fscore, "\n")
+cat("Oak F-score:", oak_fscore, "\n")
+cat("Shrub F-score:", shrub_fscore, "\n")
+
+```
+
+```{r con-ordnet, echo = FALSE, include = FALSE, warning = FALSE}
+
+csv = read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+csv = csv[, !grepl("propor", names(csv))]
+csv = csv[, !grepl("b1", names(csv))]
+csv = csv[, !grepl("b10", names(csv))]
+
+
+conifer_ord_DF = as.data.frame(csv[,c(6)])
+conifer_ord_DF = cbind(conifer_ord_DF, csv[,c(2)], csv[,c(8:66)])
+
+colnames(conifer_ord_DF)[1] = "success"
+colnames(conifer_ord_DF)[2] = "plotID"
+conifer_ord_DF = conifer_ord_DF[conifer_ord_DF$success > 0.1,]
+
+conifer_ord_DF$regenCL = ifelse(conifer_ord_DF$success < 5, "Low", 
+                            ifelse(conifer_ord_DF$success >= 5 & conifer_ord_DF$success < 25, "Medium",
+                              ifelse(conifer_ord_DF$success >= 25, "High", "NA")))
+
+counts <- table(conifer_ord_DF$regenCL)
+#barplot(counts)
+
+conifer_ord_DF = conifer_ord_DF[-1]
+
+colnames(conifer_ord_DF)[colnames(conifer_ord_DF) == "regenCL"] <- "success"
+conifer_ord_DF$success <- factor(conifer_ord_DF$success, levels = c("Low", "Medium", "High"), ordered = TRUE)
+#barplot(table(conifer_ord_DF$success))
+
+#str(conifer_ord_DF$success)
+
+# --- Step 2: Prepare X (predictors) and y (response) for ordinalNet ---
+y <- conifer_ord_DF$success
+X <- as.matrix(conifer_ord_DF[, !(colnames(conifer_ord_DF) %in% c("success", "plotID"))])
+
+
+#------------------------------------------------------------------------------
+# Remove correlated variables
+var_df <- X
+var_df <- var_df[, sort(colnames(var_df))]
+
+cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7)
+noncor_vars <- var_df[, -drop_idx]  # keep only uncorrelated predictors
+#colnames(noncor_vars)
+
+X = as.matrix(noncor_vars)
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+# 
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[1:9])  # Select top 25
+X_reduced <- as.matrix(X[, top_vars])
+
+
+# --- Step 3: Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = TRUE,  # <- enables semi-parallel model
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+# --- Step 4: Get Selected Variables at Best Lambda ---
+best_model <- cvfit$fit
+#summary(best_model)
+best_lambda_index <- which.min(cvfit$misclass)
+coefs <- coef(best_model, whichLambda = best_lambda_index, matrix = TRUE)
+
+# Display non-zero coefficients
+nonzero_vars <- rownames(coefs)[apply(coefs, 1, function(x) any(x != 0))]
+#nonzero_vars
+
+```
+
+```{r print-vars, echo = FALSE}
+print(nonzero_vars)
+```
+
+```{r conifer-predict, echo=FALSE}
+
+# scale the variables for prediction
+X_reduced_scaled <- scale(X_reduced)
+
+# Predict class labels on training data
+predicted_class <- predict(
+  cvfit$fit,
+  newx = X_reduced_scaled,
+  whichLambda = best_lambda_index,
+  type = "class"
+)
+
+
+# Confusion matrix
+#table(Observed = y, Predicted = predicted_class)
+level_labels <- c("Low", "Medium", "High")
+
+y <- factor(y, levels = level_labels, ordered = TRUE)
+predicted_class <- factor(predicted_class, 
+                          levels = 1:3, 
+                          labels = level_labels, 
+                          ordered = TRUE)
+confusionMatrix(data = predicted_class, reference = y)
+
+con_predClass = as.data.frame(predicted_class)
+con_predClass$regenCL = conifer_ord_DF$success
+con_predClass$plotID = conifer_ord_DF$plot
+```
+
+```{r oak-ordnet, echo = FALSE, include = FALSE}
+
+csv = read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+csv = csv[, !grepl("propor", names(csv))]
+
+train = csv[,c(2, 5, 8:length(csv))]
+train = train[, !grepl("propor", names(train))]
+train = subset(train, oakcount >= 1)
+
+train$success = ifelse(train$oakcount < 4, "Low", 
+                       ifelse(train$oakcount >= 4 & train$oakcount < 8, "Medium",
+                              ifelse(train$oakcount >= 8, "High", "NA")))
+
+# Check that the levels are equal
+counts <- table(train$success)
+#barplot(counts)
+
+##################################################################################
+train = train[-2] # remove the original count data
+
+# Make sure the levels are ordered correctly
+train$success <- factor(train$success, levels = c("Low","Medium", "High"), ordered = TRUE)
+#barplot(table(train$success))
+str(train$success)
+#------------------------------------------------------------------------------#
+# --- Prepare X (predictors) and y (response) for ordinalNet ---
+
+var_df = train[, !(colnames(train) %in% c("success", "plot"))]
+
+y <- train$success
+X <- as.matrix(var_df)
+
+#------------------------------------------------------------------------------
+# --- Remove Correlated Variables --
+cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7) # this will group the variables and keep the one with the highest influence
+
+if (length(drop_idx) > 0) {         # keep only uncorrelated predictors
+  noncor_vars <- var_df[, -drop_idx]
+} else {
+  noncor_vars <- var_df  # keep all variables
+} 
+colnames(noncor_vars)
+cor_matrix <- cor(noncor_vars) 
+
+#------------------------------------------------------------------------------
+# --- Kruskal-Wallis Test ---
+# Non-parametric test identifying variables with significant distribution differences across oak classes 
+
+X = noncor_vars # make new X df
+
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[c(1:5)])  # Select top 10
+#top_vars
+X_reduced <- as.matrix(X[, top_vars]) 
+
+#------------------------------------------------------------------------------
+# --- Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = TRUE,  # <- enables semi-parallel model
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+# --- Get Selected Variables at Best Lambda ---
+best_model <- cvfit$fit
+#summary(best_model)
+best_lambda_index <- which.min(cvfit$misclass)
+coefs <- coef(best_model, whichLambda = best_lambda_index, matrix = TRUE)
+
+# Display non-zero coefficients
+nonzero_vars <- rownames(coefs)[apply(coefs, 1, function(x) any(x != 0))]
+#nonzero_vars
+
+selected_vars <- setdiff(nonzero_vars, "(Intercept)")
+X_final <- scale(noncor_vars[, selected_vars])
+```
+
+```{r printOakvars, echo = FALSE}
+print(nonzero_vars)
+```
+
+```{r oak-predict, echo=FALSE}
+#------------------------------------------------------------------------------#
+# Predict
+
+# scale the variables for prediction
+X_reduced_scaled <- scale(X_reduced)
+
+# Predict class labels on training data
+predicted_class <- predict(
+  cvfit$fit,
+  newx = X_reduced_scaled,
+  whichLambda = best_lambda_index,
+  type = "class"
+)
+
+# Confusion matrix
+#table(Observed = y, Predicted = predicted_class)
+
+level_labels <- c("Low", "Medium", "High")
+
+y <- factor(y, levels = level_labels, ordered = TRUE)
+predicted_class <- factor(predicted_class, 
+                          levels = 1:3, 
+                          labels = level_labels, 
+                          ordered = TRUE)
+confusionMatrix(data = predicted_class, reference = y)
+
+oak_predClass = as.data.frame(predicted_class)
+oak_predClass$regenCL = train$success
+oak_predClass$plotID = train$plot
+```
+
+```{r shrub-ordnet, echo = FALSE, include = FALSE}
+
+csv = read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+csv = csv[, !grepl("propor", names(csv))]
+
+train = csv[,c(2, 7:66)]
+train = train[, !grepl("propor", names(train))]
+train = subset(train, shrub.percentages >= 0.1)
+
+train$success = ifelse(train$shrub.percentages < 0.4, "Low", 
+                       ifelse(train$shrub.percentages >= 0.4 & train$shrub.percentages < 0.65, "Medium",
+                              ifelse(train$shrub.percentages >= 0.65, "High", "NA")))
+
+# Check that the levels are equal
+counts <- table(train$success)
+#barplot(counts)
+
+##################################################################################
+train = train[-2] # remove the original count data
+
+# Make sure the levels are ordered correctly
+train$success <- factor(train$success, levels = c("Low","Medium", "High"), ordered = TRUE)
+#barplot(table(train$success))
+str(train$success)
+#------------------------------------------------------------------------------#
+# --- Prepare X (predictors) and y (response) for ordinalNet ---
+
+var_df = train[, !(colnames(train) %in% c("success", "plot"))]
+
+y <- train$success
+X <- as.matrix(var_df)
+
+#------------------------------------------------------------------------------
+# --- Remove Correlated Variables --
+cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7) # this will group the variables and keep the one with the highest influence
+
+if (length(drop_idx) > 0) {         # keep only uncorrelated predictors
+  noncor_vars <- var_df[, -drop_idx]
+} else {
+  noncor_vars <- var_df  # keep all variables
+} 
+colnames(noncor_vars)
+cor_matrix <- cor(noncor_vars) 
+
+#------------------------------------------------------------------------------
+# --- Kruskal-Wallis Test ---
+# Non-parametric test identifying variables with significant distribution differences across oak classes 
+
+X = noncor_vars # make new X df
+#X = X[,c(1::18)]
+
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[c(1:18)])  # Select top 10
+#top_vars
+X_reduced <- as.matrix(X[, top_vars]) 
+
+#------------------------------------------------------------------------------
+# --- Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = FALSE,
+  nonparallelTerms = TRUE,  # <- enables semi-parallel model
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+# --- Get Selected Variables at Best Lambda ---
+best_model <- cvfit$fit
+#summary(best_model)
+best_lambda_index <- which.min(cvfit$misclass)
+coefs <- coef(best_model, whichLambda = best_lambda_index, matrix = TRUE)
+
+# Display non-zero coefficients
+nonzero_vars <- rownames(coefs)[apply(coefs, 1, function(x) any(x != 0))]
+#nonzero_vars
+
+selected_vars <- setdiff(nonzero_vars, "(Intercept)")
+selected_vars = selected_vars[-5]
+X_final <- scale(noncor_vars[, selected_vars])
+```
+
+```{r printShrubvars, echo = FALSE}
+print(nonzero_vars)
+```
+
+```{r shrub-predict, echo=FALSE}
+#------------------------------------------------------------------------------#
+# Predict
+
+# scale the variables for prediction
+X_reduced_scaled <- scale(X_reduced)
+
+# Predict class labels on training data
+predicted_class <- predict(
+  cvfit$fit,
+  newx = X_reduced_scaled,
+  whichLambda = best_lambda_index,
+  type = "class"
+)
+
+# Confusion matrix
+#table(Observed = y, Predicted = predicted_class)
+
+level_labels <- c("Low", "Medium", "High")
+
+y <- factor(y, levels = level_labels, ordered = TRUE)
+predicted_class <- factor(predicted_class, 
+                          levels = 1:3, 
+                          labels = level_labels, 
+                          ordered = TRUE)
+confusionMatrix(data = predicted_class, reference = y)
+
+shrub_predClass = as.data.frame(predicted_class)
+shrub_predClass$regenCL = train$success
+shrub_predClass$plotID = train$plot
+```
+
+```{r beta-reg-load, echo = FALSE, warning = FALSE}
+
+#------------------------------------------------------------------------------
+# LOAD AND CLEAN DATA
+#------------------------------------------------------------------------------
+
+csv <- read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+
+regen <- subset(csv, shrub.percentages > 0)
+train <- regen[, c(2,7:ncol(regen))]
+train <- train[, !grepl("propor", names(train))]
+
+colnames(train)[2] <- "y"
+train$success <- as.numeric(as.character(train$y))  # beta response
+train <- train[, !(colnames(train) %in% c("y"))]
+
+hist(train$success)
+```
+
+```{r beta-reg-selection, include=FALSE, eval=FALSE}
+#------------------------------------------------------------------------------
+# REMOVE CORRELATED VARIABLES
+#------------------------------------------------------------------------------
+
+var_df <- train[, !(colnames(train) %in% c("success", "plot_id"))]
+cor_matrix <- cor(var_df)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7)
+
+if (length(drop_idx) > 0) {
+  noncor_vars <- var_df[, -drop_idx]
+} else {
+  noncor_vars <- var_df
+}
+
+# Visual check (optional)
+corrplot(cor(noncor_vars),
+         method = "color", type = "upper",
+         order = "hclust", addCoef.col = "black",
+         tl.col = "black", tl.cex = 0.8,
+         number.cex = 0.7, diag = FALSE)
+
+#------------------------------------------------------------------------------
+# GENERATE COMBINATIONS
+#------------------------------------------------------------------------------
+
+variables <- colnames(noncor_vars)
+
+get_combinations <- function(variables, n) {
+  unlist(lapply(1:n, function(x) combn(variables, x, simplify = FALSE)), recursive = FALSE)
+}
+
+combinations <- get_combinations(variables, 5)
+
+#------------------------------------------------------------------------------
+# FIT MODELS AND CALCULATE AIC
+#------------------------------------------------------------------------------
+
+aic_list = list()
+#pb <- txtProgressBar(min = 0, max = length(combinations), style = 3)
+
+for (i in seq_along(combinations)) {
+  #setTxtProgressBar(pb, i)
+  vars <- combinations[[i]]
+  form <- as.formula(paste("success ~", paste(vars, collapse = "+")))
+  
+  model <- tryCatch(betareg(form, data = train), error = function(e) NULL)
+  aic <- if (!is.null(model)) AIC(model) else 999999
+  
+  aic_list[[i]] <- data.table(
+    index = i,
+    variables = paste(vars, collapse = ", "),
+    aic = aic
+  )
+}
+#close(pb)
+
+aic_scores <- rbindlist(aic_list)
+
+#write.csv(aic_scores, "G:\\YOSE_Regen_Analysis\\Runs\\AICscoresOrdReg_conifer_081825.csv", row.names = FALSE)
+
+# Get the best row
+best_row <- aic_scores[which.min(aic_scores$aic), ]
+# View it
+#print(best_row)
+
+```
+
+```{r, shrub-stats, echo = FALSE}
+
+best_row = c("emin__TAO" , "nir", "b12", "b12w")
+
+best_vars <- unlist(strsplit(best_row, ",\\s*"))
+form <- as.formula(paste("success ~", paste(best_vars, collapse = " + ")))
+
+
+# Ensure response is in (0,1) for beta regression
+train$success <- as.numeric(train$success)
+epsilon <- 1e-4
+train$success <- pmin(pmax(train$success, epsilon), 1 - epsilon)
+
+# Define variables
+k <- 5  # number of folds
+set.seed(42)
+folds <- createFolds(train$success, k = k, list = TRUE)
+
+cv_results <- data.frame(fold = integer(), RMSE = numeric(), MAE = numeric())
+
+for (i in seq_along(folds)) {
+  test_idx <- folds[[i]]
+  train_fold <- train[-test_idx, ]
+  test_fold <- train[test_idx, ]
+  
+  model <- betareg(form, data = train_fold)
+  
+  if (!is.null(model)) {
+    preds <- predict(model, newdata = test_fold, type = "response")
+    actual <- test_fold$success
+    
+    rmse <- sqrt(mean((preds - actual)^2))
+    mae <- mean(abs(preds - actual))
+    
+    cv_results <- rbind(cv_results, data.frame(fold = i, RMSE = rmse, MAE = mae))
+  }
+}
+
+mean_rmse <- mean(cv_results$RMSE, na.rm = TRUE)
+mean_mae <- mean(cv_results$MAE, na.rm = TRUE)
+
+final_model <- betareg(form, data = train)
+summary(final_model)
+
+```
+And the error statistics:
+```{r shrub-error, echo = FALSE}
+#print(cv_results)
+cat("Mean RMSE:", mean_rmse, "\n")
+cat("Mean MAE:", mean_mae, "\n")
+```
+
+```{r shrub_resids, echo = FALSE, fig.height=8, fig.width=6}
+
+#------------------------------------------------------------------------------
+# Residuals
+#------------------------------------------------------------------------------
+
+# Extract residuals
+res <- residuals(final_model, type = "pearson")   # or type = "deviance", "response"
+
+# Basic histogram
+#hist(res, breaks = 20, main = "Histogram of Residuals", xlab = "Residuals")
+
+# Residuals vs Fitted
+# plot(predict(final_model, type = "response"), res,
+#      main = "Residuals vs Fitted Values",
+#      xlab = "Fitted Values", ylab = "Residuals")
+# abline(h = 0, col = "red", lty = 2)
+
+# # Q-Q plot for residuals
+# qqnorm(res)
+# qqline(res, col = "blue")
+
+par(mfrow = c(3, 2))
+suppressWarnings(RNGversion("3.5.0"))
+set.seed(123)
+plot(final_model, which = 1:4, type = "pearson")
+plot(final_model, which = 5, type = "deviance", sub.caption = "")
+plot(final_model, which = 1, type = "deviance", sub.caption = "")
+par(mfrow = c(1, 1))
+
+
+
+#-----------------------------------------------------------------------------
+# FIND HIGH PREFORMING VARIABLES
+# Extract diagnostics
+cd   <- cooks.distance(final_model)                 # Cook's distance
+lev  <- hatvalues(final_model)                      # Generalized leverage
+resP <- residuals(final_model, type = "pearson")    # Pearson residuals
+resD <- residuals(final_model, type = "deviance")   # Deviance residuals
+fit  <- predict(final_model, type = "response")     # Fitted values
+
+n <- length(resP)
+p <- length(coef(final_model)) 
+
+# Define thresholds
+cook_threshold <- 4 / n
+lev_threshold  <- 2 * p / n
+res_threshold  <- 2  # abs(Pearson residual)
+
+# Build table
+diagnostics <- data.frame(
+  row = seq_len(n),
+  fitted = fit,
+  pearson_resid = resP,
+  deviance_resid = resD,
+  leverage = lev,
+  cooks_distance = cd,
+  flag_cook = cd > cook_threshold,
+  flag_leverage = lev > lev_threshold,
+  flag_resid = abs(resP) > res_threshold
+)
+
+diagnostics$flag_any <- diagnostics$flag_cook | diagnostics$flag_leverage | diagnostics$flag_resid
+
+# View top rows with any flags
+#print(diagnostics[diagnostics$flag_any, ])
+
+
+#--------------------------------------------------------------------------------
+# ADD PREDICTIONS TO THEIR OWN DF
+
+fit <- predict(final_model, type = "response")
+
+shrub_pred_df = train[, c("plot", "success")]
+shrub_pred_df$predictions = fit
+
+shrub_pred_df$pred_diff = shrub_pred_df$success - shrub_pred_df$predictions
+
+```
+
+
+
+
+
+
+
+
+

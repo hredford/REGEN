@@ -1,0 +1,2896 @@
+---
+title: "Mapping dominant vegetation regeneration types across Yosemite National Park after high-severity fire"
+author: "Hannah Redford"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, out.width = "70%", fig.align = "center", time_it = TRUE, dpi = 75)
+options(kableExtra.latex.load_packages = FALSE)
+#knitr::opts_knit$set(root.dir = 'U:/SEFS_ESRM_533_433/')
+knitr::opts_knit$set(root.dir = "G:\\REGEN")
+# knitr::opts_knit$set(root.dir = 'C:/Users/ajs0428/OneDrive - UW/University of Washington/Teaching/SEFS433_Lidar/Labs/')
+  library(lidRplugins)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(glmnet)
+  library(MuMIn)
+  library(Rcpp)
+  library(furrr)
+  library(dplyr)
+  library(parallel)
+  library(future)
+  library(yardstick)
+  library(caret)
+  library(corrplot)
+  library(ordinalNet)
+  library(kableExtra)
+  library(betareg)
+library(terra)
+
+rm(list = ls())
+
+date = Sys.Date()
+```
+
+
+```{r remove-correlation, echo=FALSE}
+#------------------------------------------------------------------------------
+# Remove correlated variables
+
+csv = read.csv("G:\\REGEN\\Plot_Level_Datasets\\response_metrix_102325.csv")
+csv = csv[, !grepl("propor", names(csv))]
+cutoff       <- 0.60
+csv = na.omit(csv)
+
+# y and predictor block (cols 8:n)
+y <- csv$regencount
+X <- csv[, 5:ncol(csv), drop = FALSE]
+
+# 1) Build absolute-correlation distance and clusters
+Cabs <- abs(cor(X, use = "pairwise.complete.obs"))
+D    <- as.dist(1 - Cabs)
+hc   <- hclust(D, method = "average")
+
+# Cut the tree at (1 - cutoff) to define clusters
+cutoff <- 0.7
+groups <- cutree(hc, h = 1 - cutoff)
+
+# 2) Split variables by cluster
+clusters <- split(colnames(X), groups)
+
+# 3) Choose one representative per cluster
+# method = "random" | "variance" | "meanabs"
+choose_reps <- function(clusters, X, Cabs, method, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  reps <- character(length(clusters))
+  i <- 0
+  for (vars in clusters) {
+    i <- i + 1
+    if (length(vars) == 1) {
+      reps[i] <- vars
+    } else if (method == "random") {
+      reps[i] <- sample(vars, 1L)
+    } else if (method == "variance") {
+      v <- sapply(vars, function(vv) stats::var(X[[vv]], na.rm = TRUE))
+      reps[i] <- vars[which.max(v)]
+    } else if (method == "meanabs") {
+      # pick the var with the smallest mean abs correlation to its cluster mates
+      m <- sapply(vars, function(vv) {
+        mates <- setdiff(vars, vv)
+        mean(Cabs[vv, mates], na.rm = TRUE)
+      })
+      reps[i] <- vars[which.min(m)]
+    } else {
+      stop("Unknown method")
+    }
+  }
+  reps
+}
+
+# Examples:
+reps_random   <- choose_reps(clusters, X, Cabs, method = "random",   seed = 1L)
+reps_variance <- choose_reps(clusters, X, Cabs, method = "variance")
+reps_meanabs  <- choose_reps(clusters, X, Cabs, method = "meanabs")
+
+# 4) Build alternative non-correlated matrices
+X_nc_random   <- X[, reps_random,   drop = FALSE]
+X_nc_variance <- X[, reps_variance, drop = FALSE]
+X_nc_meanabs  <- X[, reps_meanabs,  drop = FALSE]
+
+noncor_vars = X_nc_meanabs
+
+
+```
+
+```{r, load-conifer-data, echo= FALSE}
+
+coniferDF = as.data.frame(csv[,c(3)])
+coniferDF = cbind(coniferDF, noncor_vars[,-1])
+
+colnames(coniferDF)[1] = "y"
+coniferDF$y[coniferDF$y < 1] = 0
+coniferDF$y[coniferDF$y >= 1] = 1
+
+coniferDF$success = coniferDF$y
+coniferDF = coniferDF[,-1]
+coniferDF$success = as.numeric(coniferDF$success)
+# coniferDF$plot_id = 1:length(coniferDF[,1])
+# n_plots = length(coniferDF[,1])
+
+#head(coniferDF)
+
+```
+
+```{r, load-oak-data, echo= FALSE}
+
+oakDF = as.data.frame(csv[,c(2)])
+oakDF = cbind(oakDF, noncor_vars[,-1])
+
+colnames(oakDF)[1] = "y"
+oakDF$y[oakDF$y < 1] = 0
+oakDF$y[oakDF$y >= 1] = 1
+
+
+oakDF$success = oakDF$y
+oakDF = oakDF[,-1]
+oakDF$success = as.numeric(oakDF$success)
+
+# oakDF$plot_id = 1:length(oakDF[,1])
+# n_plots = length(oakDF[,1])
+
+#head(oakDF)
+
+```
+  
+```{r, load-shrub-data, echo= FALSE}
+
+shrubDF = as.data.frame(csv[,4])
+shrubDF = cbind(shrubDF, noncor_vars[,-1])
+
+
+colnames(shrubDF)[1] = "y"
+shrubDF$y[shrubDF$y < 0.1] = 0
+shrubDF$y[shrubDF$y >= 0.1] = 1
+
+
+shrubDF$success = shrubDF$y
+shrubDF = shrubDF[,-1]
+shrubDF$success = as.numeric(shrubDF$success)
+# shrubDF$plot_id = 1:length(shrubDF[,1])
+# n_plots = length(shrubDF[,1])
+
+#head(shrubDF)
+
+```
+
+```{r AIC-function, echo = FALSE, warning=FALSE, eval =FALSE}
+
+find_best_logistic_model <- function(data, response_var, max_predictors = 6, corr_threshold = 0.6) {
+  all_vars    <- setdiff(names(data), response_var)
+  best_aic    <- Inf
+  best_model  <- NULL
+  best_formula<- NULL
+
+  # Helper: test if any pairwise correlation exceeds threshold
+  has_high_corr <- function(df, thr) {
+    if (ncol(df) < 2) return(FALSE)
+    cm <- suppressWarnings(stats::cor(df, use = "pairwise.complete.obs"))
+    upper_vals <- cm[upper.tri(cm, diag = FALSE)]
+    any(abs(upper_vals) > thr, na.rm = TRUE)
+  }
+
+  total_models <- sum(sapply(1:max_predictors, function(k) choose(length(all_vars), k)))
+  # pb <- txtProgressBar(min = 0, max = total_models, style = 3)
+  # counter <- 0
+
+  for (k in 1:max_predictors) {
+    combos <- combn(all_vars, k, simplify = FALSE)
+    for (vars in combos) {
+      # counter <- counter + 1
+      # setTxtProgressBar(pb, counter)
+
+      # Only test correlations on numeric predictors
+      num_vars <- vars[sapply(vars, function(v) is.numeric(data[[v]]))]
+      if (length(num_vars) >= 2) {
+        if (has_high_corr(data[, num_vars, drop = FALSE], corr_threshold)) next
+      }
+
+      formula_str <- paste(response_var, "~", paste(vars, collapse = " + "))
+      model <- tryCatch(
+        stats::glm(stats::as.formula(formula_str), data = data, family = stats::binomial),
+        error = function(e) NULL
+      )
+
+      if (!is.null(model)) {
+        current_aic <- stats::AIC(model)
+        if (!is.na(current_aic) && current_aic < best_aic) {
+          best_aic     <- current_aic
+          best_model   <- model
+          best_formula <- formula_str
+        }
+      }
+    }
+  }
+
+  # close(pb)
+  list(
+    best_model  = best_model,
+    best_formula= best_formula,
+    best_aic    = best_aic
+  )
+}
+
+```
+
+```{r conifer-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+
+# run the function for conifers
+con_result <- find_best_logistic_model(data = coniferDF, response_var = "success")
+
+saveRDS(con_result, file = sprintf("Plot_Level_Products\\Models\\con_result_%s.rds", date))
+
+```
+
+```{r oak-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+# run the function for conifers
+oak_result <- find_best_logistic_model(data = oakDF, response_var = "success")
+
+saveRDS(oak_result, file = sprintf("Plot_Level_Products\\Models\\oak_result_%s.rds", date))
+
+```
+
+```{r shrub-AIC, echo = FALSE, warning=FALSE, eval = FALSE}
+
+# run the function for conifers
+shrub_result <- find_best_logistic_model(data = shrubDF, response_var = "success")
+
+saveRDS(shrub_result, file = sprintf("Plot_Level_Products\\Models\\shr_result_%s.rds", date))
+
+```
+
+
+```{r var-results, echo=FALSE}
+
+con_result <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\con_result_%s.rds", date))
+oak_result <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\oak_result_%s.rds", date))
+shr_result <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\shr_result_%s.rds", date))
+
+# con_result$best_formula = "success ~ iqr_90to99 + linear_90to99 "
+# shr_result$best_formula = "success ~ p25_85to95 + zmean_85to95 + ndvi + ndirs + ndirw"
+# View results
+# cat("Best formula Conifer Model:", con_result$best_formula, "\n")
+# cat("Best AIC Conifer Model:", con_result$best_aic, "\n")
+# #summary(result$best_model)
+# 
+# cat("Best formula Oak Model:", oak_result$best_formula, "\n")
+# cat("Best AIC Oak Model:", oak_result$best_aic, "\n")
+# 
+# # View results
+# cat("Best formula Shrub Model:", shr_result$best_formula, "\n")
+# cat("Best AIC Shrub Model:", shr_result$best_aic, "\n")
+
+```
+
+```{r all_lr_tests, echo = FALSE, warning=FALSE}
+
+# Helper function: leave-one-out CV confusion matrix + metrics
+loo_confmat <- function(df, formula_str, thresh) {
+  n <- nrow(df)
+  pred_class <- integer(n)
+
+  for (i in seq_len(n)) {
+    # Leave-one-out training set
+    train_df <- df[-i, ]
+
+    # Fit GLM
+    glmmodel <- glm(as.formula(formula_str), data = train_df, family = binomial)
+
+    # Predict on the left-out obs
+    pred <- predict(glmmodel, df[i, ], type = "response")
+
+    # Classify as 0/1
+    pred_class[i] <- ifelse(pred > thresh, 1, 0)
+  }
+
+  # True labels
+  true_class <- df$success
+
+  # Confusion matrix (caret)
+  cm <- confusionMatrix(factor(pred_class), factor(true_class))
+
+  # Basic manual metrics
+  truepos <- sum(pred_class == 1 & true_class == 1)
+  falspos <- sum(pred_class == 1 & true_class == 0)
+  falsneg <- sum(pred_class == 0 & true_class == 1)
+  trueneg <- sum(pred_class == 0 & true_class == 0)
+
+  precision <- truepos / (truepos + falspos)
+  recall    <- truepos / (truepos + falsneg)
+  fscore    <- 2 * (precision * recall) / (precision + recall)
+
+  list(
+    confusion = cm,
+    precision = precision,
+    recall    = recall,
+    fscore    = fscore
+  )
+}
+
+
+# ---- Run for each vegetation type ----
+conLR_res   <- loo_confmat(coniferDF, con_result$best_formula, thresh = 0.55)
+oakLR_res   <- loo_confmat(oakDF,     oak_result$best_formula, thresh = 0.5)
+shrubLR_res <- loo_confmat(shrubDF,   shr_result$best_formula, thresh = 0.6)
+
+# # Each object holds a caret confusion matrix + precision/recall/F1
+# conLR_res$confusion
+# oakLR_res$confusion
+# shrubLR_res$confusion
+# 
+# conLR_res$fscore
+# oakLR_res$fscore
+# shrubLR_res$fscore
+
+```
+
+
+```{r con-ordnet-setup, echo = FALSE, include = FALSE, warning = FALSE}
+
+conifer_ord_DF = as.data.frame(csv[,c(3)])
+conifer_ord_DF = cbind(conifer_ord_DF, csv[,c(1)], csv[,c(5:length(csv))])
+
+colnames(conifer_ord_DF)[1] = "success"
+colnames(conifer_ord_DF)[2] = "plotID"
+conifer_ord_DF = conifer_ord_DF[conifer_ord_DF$success >= 1,]
+
+conifer_ord_DF$regenCL = ifelse(conifer_ord_DF$success < 5, "Low", 
+                            ifelse(conifer_ord_DF$success >= 5 & conifer_ord_DF$success < 18, "Medium",
+                              ifelse(conifer_ord_DF$success >= 18, "High", "NA")))sn
+counts <- table(conifer_ord_DF$regenCL)
+barplot(counts)
+
+conifer_ord_DF = conifer_ord_DF[-1]
+colnames(conifer_ord_DF)[colnames(conifer_ord_DF) == "regenCL"] <- "success"
+conifer_ord_DF$success <- factor(conifer_ord_DF$success, levels = c("Low", "Medium", "High"), ordered = TRUE)
+
+# --- Prepare X (predictors) and y (response) for ordinalNet ---
+y <- conifer_ord_DF$success
+X <- as.matrix(conifer_ord_DF[, !(colnames(conifer_ord_DF) %in% c("success", "plotID"))])
+
+
+# #------------------------------------------------------------------------------
+# # Remove correlated variables
+# var_df <- X
+# var_df <- var_df[, sort(colnames(var_df))]
+# 
+# cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+# drop_idx <- findCorrelation(cor_matrix, cutoff = 0.6)
+# noncor_vars <- var_df[, -drop_idx]  # keep only uncorrelated predictors
+# #colnames(noncor_vars)
+
+# 1) Build absolute-correlation distance and clusters
+Cabs <- abs(cor(X, use = "pairwise.complete.obs"))
+D    <- as.dist(1 - Cabs)
+hc   <- hclust(D, method = "average")
+
+# Cut the tree at (1 - cutoff) to define clusters
+cutoff <- 0.7
+groups <- cutree(hc, h = 1 - cutoff)
+
+# 2) Split variables by cluster
+clusters <- split(colnames(X), groups)
+
+# 3) Choose one representative per cluster
+# method = "random" | "variance" | "meanabs"
+choose_reps <- function(clusters, X, Cabs, method, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  reps <- character(length(clusters))
+  i <- 0
+  for (vars in clusters) {
+    i <- i + 1
+    if (length(vars) == 1) {
+      reps[i] <- vars
+    } else if (method == "random") {
+      reps[i] <- sample(vars, 1L)
+    } else if (method == "variance") {
+      v <- sapply(vars, function(vv) stats::var(X[[vv]], na.rm = TRUE))
+      reps[i] <- vars[which.max(v)]
+    } else if (method == "meanabs") {
+      # pick the var with the smallest mean abs correlation to its cluster mates
+      m <- sapply(vars, function(vv) {
+        mates <- setdiff(vars, vv)
+        mean(Cabs[vv, mates], na.rm = TRUE)
+      })
+      reps[i] <- vars[which.min(m)]
+    } else {
+      stop("Unknown method")
+    }
+  }
+  reps
+}
+
+# Examples:
+reps_random   <- choose_reps(clusters, X, Cabs, method = "random",   seed = 1L)
+#reps_variance <- choose_reps(clusters, X, Cabs, method = "variance")
+reps_meanabs  <- choose_reps(clusters, X, Cabs, method = "meanabs")
+
+# 4) Build alternative non-correlated matrices
+X_nc_random   <- X[, reps_random,   drop = FALSE]
+#X_nc_variance <- X[, reps_variance, drop = FALSE]
+X_nc_meanabs  <- X[, reps_meanabs,  drop = FALSE]
+
+noncor_vars = X_nc_meanabs
+
+
+X = noncor_vars
+
+#------------------------------------------------------------------------------
+#------------------------------------------------------------------------------
+# 
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[1:5])  # Select top 25
+con_X_reduced <- as.matrix(X[, top_vars])
+```
+
+```{r con-ordnet-DONTRUN, echo = FALSE, include = FALSE, warning = FALSE, eval = FALSE}
+
+## --- Step 3: Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(con_X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = TRUE,
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  standardize = FALSE,  # Let the model handle scaling
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+con_OLR_model = cvfit
+saveRDS(con_OLR_model, file = sprintf("Plot_Level_Products\\Models\\con_OLR_model_%s.rds", date))
+
+con_coefs <- coef(con_OLR_model$fit, whichLambda = which.min(con_OLR_model$misclass), matrix = TRUE)
+con_OLR_vars <- rownames(con_coefs)[apply(con_coefs, 1, function(x) any(x != 0))]
+con_OLR_vars <- con_OLR_vars[con_OLR_vars != "(Intercept)"]
+#con_OLR_vars
+
+# Predict class labels on training data
+con_predicted_class <- predict(
+  con_OLR_model$fit,
+  newx = scale(con_X_reduced),
+  whichLambda = which.min(con_OLR_model$misclass),
+  type = "class"
+)
+
+# Confusion matrix
+#table(Observed = y, Predicted = predicted_class)
+level_labels <- c("Low", "Medium", "High")
+
+con_y <- factor(conifer_ord_DF$success, levels = level_labels, ordered = TRUE)
+con_predicted_class <- factor(con_predicted_class,
+                          levels = 1:3,
+                          labels = level_labels,
+                          ordered = TRUE)
+conCM = confusionMatrix(data = con_predicted_class, reference = con_y)
+#conCM
+
+con_predClass = as.data.frame(con_predicted_class)
+con_predClass$regenCL = conifer_ord_DF$success
+con_predClass$plotID = conifer_ord_DF$plot
+
+rm(cvfit)
+```
+
+
+```{r oak-ordnet-setup, echo = FALSE, include = FALSE}
+
+# csv = read.csv("G:\\YOSE_Regen_Analysis\\Runs\\April18_run_CURRENT\\Plot_Level_Datasets\\responsematrix_06-19-25.csv")
+# csv = csv[, !grepl("propor", names(csv))]
+
+oak_OLR_DF = csv[,c(1, 2, 5:length(csv))]
+oak_OLR_DF = subset(oak_OLR_DF, oakcount >= 1)
+
+oak_OLR_DF$success = ifelse(oak_OLR_DF$oakcount < 4, "Low", 
+                       ifelse(oak_OLR_DF$oakcount >= 4 & oak_OLR_DF$oakcount < 8, "Medium",
+                              ifelse(oak_OLR_DF$oakcount >= 8, "High", "NA")))
+
+# Check that the levels are equalgams
+counts <- table(oak_OLR_DF$success)
+#barplot(counts)
+
+##################################################################################
+oak_OLR_DF = oak_OLR_DF[-2] # remove the original count data
+
+# Make sure the levels are ordered correctly
+oak_OLR_DF$success <- factor(oak_OLR_DF$success, levels = c("Low","Medium", "High"), ordered = TRUE)
+#barplot(table(oak_OLR_DF$success))
+str(oak_OLR_DF$success)
+#------------------------------------------------------------------------------#
+# --- Prepare X (predictors) and y (response) for ordinalNet ---
+
+var_df = oak_OLR_DF[, !(colnames(oak_OLR_DF) %in% c("success", "plot"))]
+
+y <- oak_OLR_DF$success
+X <- as.matrix(var_df)
+
+#------------------------------------------------------------------------------
+# --- Remove Correlated Variables --
+# cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+# drop_idx <- findCorrelation(cor_matrix, cutoff = 0.7) # this will group the variables and keep the one with the highest influence
+# 
+# if (length(drop_idx) > 0) {         # keep only uncorrelated predictors
+#   noncor_vars <- var_df[, -drop_idx]
+# } else {
+#   noncor_vars <- var_df  # keep all variables
+# }
+# colnames(noncor_vars)
+# cor_matrix <- cor(noncor_vars)
+
+# 1) Build absolute-correlation distance and clusters
+Cabs <- abs(cor(X, use = "pairwise.complete.obs"))
+D    <- as.dist(1 - Cabs)
+hc   <- hclust(D, method = "average")
+
+# Cut the tree at (1 - cutoff) to define clusters
+cutoff <- 0.7
+groups <- cutree(hc, h = 1 - cutoff)
+
+# 2) Split variables by cluster
+clusters <- split(colnames(X), groups)
+
+# 3) Choose one representative per cluster
+# method = "random" | "variance" | "meanabs"
+choose_reps <- function(clusters, X, Cabs, method, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  reps <- character(length(clusters))
+  i <- 0
+  for (vars in clusters) {
+    i <- i + 1
+    if (length(vars) == 1) {
+      reps[i] <- vars
+    } else if (method == "random") {
+      reps[i] <- sample(vars, 1L)
+    } else if (method == "variance") {
+      v <- sapply(vars, function(vv) stats::var(X[[vv]], na.rm = TRUE))
+      reps[i] <- vars[which.max(v)]
+    } else if (method == "meanabs") {
+      # pick the var with the smallest mean abs correlation to its cluster mates
+      m <- sapply(vars, function(vv) {
+        mates <- setdiff(vars, vv)
+        mean(Cabs[vv, mates], na.rm = TRUE)
+      })
+      reps[i] <- vars[which.min(m)]
+    } else {
+      stop("Unknown method")
+    }
+  }
+  reps
+}
+
+# Examples:
+reps_random   <- choose_reps(clusters, X, Cabs, method = "random",   seed = 1L)
+#reps_variance <- choose_reps(clusters, X, Cabs, method = "variance")
+reps_meanabs  <- choose_reps(clusters, X, Cabs, method = "meanabs")
+
+# 4) Build alternative non-correlated matrices
+X_nc_random   <- X[, reps_random,   drop = FALSE]
+#X_nc_variance <- X[, reps_variance, drop = FALSE]
+X_nc_meanabs  <- X[, reps_meanabs,  drop = FALSE]
+
+noncor_vars = X_nc_meanabs
+
+#------------------------------------------------------------------------------
+# --- Kruskal-Wallis Test ---
+# Non-parametric test identifying variables with significant distribution differences across oak classes 
+
+X = as.data.frame(noncor_vars) # make new X df
+#X$rumple_55to85 = oak_OLR_DF$rumple_55to85
+
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[c(1:5)])  # Select top 10
+#top_vars
+oak_X_reduced <- as.matrix(X[, top_vars]) 
+```
+
+```{r oak-ordnet-DONTRUN, echo = FALSE, include = FALSE, eval = FALSE}
+# #------------------------------------------------------------------------------
+# # --- Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(oak_X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = TRUE,
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  standardize = FALSE,
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+oak_OLR_model = cvfit
+#saveRDS(oak_OLR_model, file = sprintf("Plot_Level_Products\\Models\\oak_OLR_model_%s.rds", date))
+
+oak_coefs <- coef(oak_OLR_model$fit, whichLambda = which.min(oak_OLR_model$misclass), matrix = TRUE)
+oak_OLR_vars <- rownames(oak_coefs)[apply(oak_coefs, 1, function(x) any(x != 0))]
+oak_OLR_vars <- oak_OLR_vars[oak_OLR_vars != "(Intercept)"]
+oak_OLR_vars
+
+# Predict class labels on training data
+predicted_class <- predict(
+  oak_OLR_model$fit,
+  newx = scale(oak_X_reduced),
+  whichLambda = which.min(oak_OLR_model$misclass),
+  type = "class"
+)
+
+y <- factor(oak_OLR_DF$success, levels = level_labels, ordered = TRUE)
+predicted_class <- factor(predicted_class,
+                          levels = 1:3,
+                          labels = level_labels,
+                          ordered = TRUE)
+oakCM = confusionMatrix(data = predicted_class, reference = y)
+#oakCM
+
+oak_predClass = as.data.frame(predicted_class)
+oak_predClass$regenCL = oak_OLR_DF$success
+oak_predClass$plotID = oak_OLR_DF$plot
+
+rm(cvfit)
+```
+
+```{r shrub-ordnet-setup, echo = FALSE, include = FALSE}
+#--------------------------------------------------------------------------------------------------------------------
+# Shrub Ordinal Reg
+#----------------------------------------------------------------------------------------------------------------------
+
+shrub_OLR_DF = csv[,c(1, 4:ncol(csv))]
+shrub_OLR_DF = subset(shrub_OLR_DF, shrub.percentages >= 0.01)
+
+shrub_OLR_DF$success = ifelse(shrub_OLR_DF$shrub.percentages < 0.4, "Low", 
+                       ifelse(shrub_OLR_DF$shrub.percentages >= 0.4 & shrub_OLR_DF$shrub.percentages < 0.7, "Medium",
+                              ifelse(shrub_OLR_DF$shrub.percentages >= 0.7, "High", "NA")))
+
+##################################################################################
+shrub_OLR_DF = shrub_OLR_DF[-2] # remove the original count data
+
+# Make sure the levels are ordered correctly
+shrub_OLR_DF$success <- factor(shrub_OLR_DF$success, levels = c("Low","Medium", "High"), ordered = TRUE)
+#barplot(table(shrub_OLR_DF$success))
+str(shrub_OLR_DF$success)
+#------------------------------------------------------------------------------#
+# --- Prepare X (predictors) and y (response) for ordinalNet ---
+
+var_df = shrub_OLR_DF[, !(colnames(shrub_OLR_DF) %in% c("success", "plot"))]
+y <- shrub_OLR_DF$success
+X <- as.matrix(var_df)
+
+#------------------------------------------------------------------------------
+# --- Remove Correlated Variables --
+cor_matrix <- cor(var_df)  # X = predictor matrix (no response var)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.6) # this will group the variables and keep the one with the highest influence
+
+if (length(drop_idx) > 0) {         # keep only uncorrelated predictors
+  noncor_vars <- var_df[, -drop_idx]
+} else {
+  noncor_vars <- var_df  # keep all variables
+} 
+colnames(noncor_vars)
+cor_matrix <- cor(noncor_vars) 
+
+#------------------------------------------------------------------------------
+# --- Kruskal-Wallis Test ---
+# Non-parametric test identifying variables with significant distribution differences across oak classes 
+
+X = noncor_vars # make new X df
+#X = X[,c(1::18)]
+
+kruskal_results <- apply(X, 2, function(x) kruskal.test(x ~ y)$p.value)
+top_vars <- na.omit(names(sort(kruskal_results))[c(1:10)])  # Select top 10
+#top_vars = top_vars[c(1:3,6,7,10,12,14,17,18)]
+shrub_X_reduced <- as.matrix(X[, top_vars]) 
+```
+
+```{r shrub-ordnet-DONTRUN, echo = FALSE, include = FALSE, eval = FALSE}
+#------------------------------------------------------------------------------
+# --- Fit Penalized Ordinal Logistic Regression with Cross-Validation ---
+set.seed(123)
+cvfit <- ordinalNetCV(
+  x = scale(shrub_X_reduced),
+  y = y,
+  family = "cumulative",
+  link = "logit",
+  parallelTerms = TRUE,
+  nonparallelTerms = TRUE,
+  alpha = 0.5,
+  tuneMethod = "cvLoglik",
+  standardize = FALSE,
+  maxiterOut = 500,
+  maxiterIn = 500
+)
+
+shr_OLR_model = cvfit
+saveRDS(shr_OLR_model, file = sprintf("Plot_Level_Products\\Models\\shr_OLR_model_%s.rds", date))
+
+shrub_coefs <- coef(shr_OLR_model$fit, whichLambda = which.min(shr_OLR_model$misclass), matrix = TRUE)
+shrub_OLR_vars <- rownames(shrub_coefs)[apply(shrub_coefs, 1, function(x) any(x != 0))]
+shrub_OLR_vars <- shrub_OLR_vars[shrub_OLR_vars != "(Intercept)"]
+#shrub_OLR_vars
+
+#### PREDITCT
+
+# Predict class labels on training data
+predicted_class <- predict(
+  shr_OLR_model$fit,
+  newx = scale(shrub_X_reduced),
+  whichLambda = which.min(shr_OLR_model$misclass),
+  type = "class"
+)
+
+y <- factor(shrub_OLR_DF$success, levels = level_labels, ordered = TRUE)
+
+y = shrub_OLR_DF$success
+predicted_class <- factor(predicted_class,
+                          levels = 1:3,
+                          labels = level_labels,
+                          ordered = TRUE)
+shrubCM = confusionMatrix(data = predicted_class, reference = y)
+#shrubCM
+
+# shrub_predClass = as.data.frame(BR_preds_class)
+# shrub_predClass$regenCL = train$success
+# shrub_predClass$plotID = train$plot
+
+
+
+rm(cvfit)
+
+```
+
+```{r beta-reg-load, echo = FALSE, warning = FALSE}
+
+#------------------------------------------------------------------------------
+# LOAD AND CLEAN DATA
+#------------------------------------------------------------------------------
+regen <- subset(csv, shrub.percentages > 0)
+train <- regen[, c(1,4:ncol(regen))]
+train <- train[, !grepl("propor", names(train))]
+
+colnames(train)[2] <- "y"
+train$success <- as.numeric(as.character(train$y))  # beta response
+train <- train[, !(colnames(train) %in% c("y"))]
+
+#hist(train$success)
+```
+
+```{r beta-reg-selection--DONTRUN, include=FALSE, eval=FALSE}
+#------------------------------------------------------------------------------
+# REMOVE CORRELATED VARIABLES
+#------------------------------------------------------------------------------
+
+var_df <- train[, !(colnames(train) %in% c("success", "plot"))]
+cor_matrix <- cor(var_df)
+drop_idx <- findCorrelation(cor_matrix, cutoff = 0.6)
+
+if (length(drop_idx) > 0) {
+  noncor_vars <- var_df[, -drop_idx]
+} else {
+  noncor_vars <- var_df
+}
+
+# Visual check (optional)
+corrplot(cor(noncor_vars),
+         method = "color", type = "upper",
+         order = "hclust", addCoef.col = "black",
+         tl.col = "black", tl.cex = 0.8,
+         number.cex = 0.7, diag = FALSE)
+
+#------------------------------------------------------------------------------
+# GENERATE COMBINATIONS
+#------------------------------------------------------------------------------
+
+variables <- colnames(noncor_vars)
+
+get_combinations <- function(variables, n) {
+  unlist(lapply(1:n, function(x) combn(variables, x, simplify = FALSE)), recursive = FALSE)
+}
+
+combinations <- get_combinations(variables, 5)
+
+#------------------------------------------------------------------------------
+# FIT MODELS AND CALCULATE AIC
+#------------------------------------------------------------------------------
+
+aic_list = list()
+#pb <- txtProgressBar(min = 0, max = length(combinations), style = 3)
+#combinations = combinations[1:length(combinations)]
+
+for (i in seq_along(combinations)) {
+  #setTxtProgressBar(pb, i)
+  vars <- combinations[[i]]
+  form <- as.formula(paste("success ~", paste(vars, collapse = "+")))
+
+  model <- tryCatch(betareg(form, data = train), error = function(e) NULL)
+  aic <- if (!is.null(model)) AIC(model) else 999999
+
+  aic_list[[i]] <- data.table::data.table(
+    index = i,
+    variables = paste(vars, collapse = ", "),
+    aic = aic
+  )
+}
+#close(pb)
+
+aic_scores <- data.table::rbindlist(aic_list)
+
+#write.csv(aic_scores, "G:\\YOSE_Regen_Analysis\\Runs\\AICscoresOrdReg_conifer_081825.csv", row.names = FALSE)
+
+# Get the best row
+best_row <- aic_scores[which.min(aic_scores$aic), ]
+# View it
+#print(best_row)
+
+```
+
+```{r, shrub-stats, echo = FALSE}
+
+train = csv[,c(1,4:ncol(csv))]
+colnames(train)[2] = "success"
+train = subset(train, success >= 0.1)
+
+
+best_row = c("emid_55to85", "planar_90to99", "junendvi", "octndvi")
+
+best_vars <- unlist(strsplit(best_row, ",\\s*"))
+form <- as.formula(paste("success ~", paste(best_vars, collapse = " + ")))
+
+
+# Ensure response is in (0,1) for beta regression
+train$success <- as.numeric(train$success)
+epsilon <- 1e-4
+train$success <- pmin(pmax(train$success, epsilon), 1 - epsilon)
+# 
+# Define variables
+k <- 5  # number of folds
+set.seed(42)
+folds <- createFolds(train$success, k = k, list = TRUE)
+
+cv_results <- data.frame(fold = integer(), RMSE = numeric(), MAE = numeric())
+
+for (i in seq_along(folds)) {
+  test_idx <- folds[[i]]
+  train_fold <- train[-test_idx, ]
+  test_fold <- train[test_idx, ]
+  
+  model <- betareg(form, data = train_fold)
+  
+  if (!is.null(model)) {
+    preds <- predict(model, newdata = test_fold, type = "response")
+    actual <- test_fold$success
+    
+    rmse <- sqrt(mean((preds - actual)^2))
+    mae <- mean(abs(preds - actual))
+    
+    cv_results <- rbind(cv_results, data.frame(fold = i, RMSE = rmse, MAE = mae))
+  }
+}
+
+mean_rmse <- mean(cv_results$RMSE, na.rm = TRUE)
+mean_mae <- mean(cv_results$MAE, na.rm = TRUE)
+
+final_BR_model <- betareg(form, data = train)
+#summary(final_BR_model)
+
+###########################################
+```
+
+# Introduction
+
+Globally, wildfires are increasing in size and severity as ecosystems are driven beyond static thresholds of resilience by anthropogenic climate change (Abatzoglou & Williams, 2016; Seidl et al., 2017; Turco et al. 2023) and past land-management practices such as fire suppression and exclusion (Safford et al. 2021; Hagmann et al, 2021). California is at the forefront of this fire regime change with many large fires (defined loosely by fires ranging from 5,000 to 50,000 ha or greater) becoming increasingly common in the past several decades (Barbero et al, 2014; Stephens et al, 2014; Keeley and Syphard, 2021, Cova et al, 2023). Increasing severity of these fires creates vast contiguous patches of high-severity burned area, leading to the homogenization of stand-level landscape patterns previously maintained by frequent, low or moderate severity wildfires (Cansler and Mackenzie 2014; Stephens et al., 2022, Cova et al, 2023). Without a viable seed source (i.e. seed banks, legacy mature trees, or failed seed establishment), large patches of stand-replacing fire in conifer dominated forests may experience vegetation type conversion, in which forest structure and composition shift either temporarily or represent a long-lasting type conversion (Haire and McGarigal 2010, Crotteau et al. 2013, Welch et al. 2016 Shive et al, 2018).
+
+## Post-Fire Regeneration
+
+The capacity for ecosystems to undergo regeneration following stand-replacing disturbance events is essential in understanding their long-term persistence within disturbance dynamics (Holling, 1973; Johnstone et al, 2016; Falk et al, 2022). The resilience of these systems, or lack thereof, in the face of increased disturbance frequencies and magnitudes raises questions about the thresholds beyond which ecosystems may not reliably return to their pre-disturbance states (Parsons and DeBenedetti, 1979; Millar and Stephnson, 2015; Stevens-Rumann et al, 2017). For example, when trees fail to regenerate following a stand-replacing fire event, the forest undergoes type conversion, transitioning from forest to a different vegetation type, such as shrubland or grassland. This change represents a new, or returning, ecological state with different species compositions, structures, and functions (Hessburg et al. 2019; Coop et al, 2020). However, in cases of prolonged soil water deficits and continued tree regeneration failure, it can lead to a long-term shift to a new ecological state characterized by distinct species compositions, structures, and functions (Allen et al, 2010; Williams et al, 2013; Martinez-Vilalta et al, 2016). 
+
+The spatial and temporal scale at which post-fire regeneration operates is increasing (Mallek et al, 2013; Buonanduci et al, 2024), but empirical field studies do not have the ability to capture the diversity and density of successional outcomes on these scales. Large patches of high-severity fire are a relatively recent phenomenon in frequent fire forests (Miller et al, 2012; Singleton et al, 2019; Cova et al, 2023), and forest recruitment in dry forests is an episodic process, meaning it requires favorable conditions for it to occur (i.e. precipitation, masting events, herbivory levels) (Fowells and Schubert, 1956; Paudel et al., 2022). While empirical field work is essential to understanding patterns of recruitment and post-fire succession, studies are limited by funding, access, and time. To evaluate the extent of forest type-conversion in the Sierra Nevada, it is essential to study post-fire vegetation dynamics across broad spatial scales spanning several decades following fire events.
+
+## Remote Sensing as a Tool for Identifying Ecological Succession
+
+Previous remote sensing methods developed to quantify forest succession across broader scales fall into two categories: satellite imagery land cover change over time, and airborne or terrestrial lidar object detection. Land cover does not represent a specific function or process; therefore, land cover/land use classifications are typically considered a “structural” dataset (Tischendorf and Fahrig 2000; Riva and Nielsen 2020). An example of post-fire succession using a land cover dataset is Vanderhoof et al. (2021). This method showcases the utility of Landsat NDVI in forest succession to model conifer recovery rates. By utilizing the temporal domain across multiple seasons, as well as over multiple years, they extracted detailed vegetation insights into post-fire forest succession. 
+
+Studies that approach detection with airborne lidar typically do better detecting total biomass or volume of understory rather than individual regenerating tree detection (Jarron et al, 2020). In the case of individual tree detection, Du et al. (2024) accurately detected individual conifer saplings in their study through using an adapted mean shift clustering algorithm. However, their study site was on a plantation with all trees being even aged, planted in lines, and a very open understory that does not accurately represent wildland vegetation structure. While methods in Du et al. (2024) offer useful insights into understory tree detection, they cannot be applied to wildland vegetation scenarios. Multispectral lidar is another method used to detect successional patterns (Martin-Alcon et al, 2015; Enayetullah et al, 2022), however that data is not readily available for managers to use throughout most of the United States. 
+
+## Objectives
+
+The novel methods introduced in this paper address the successional diversity issue in sampling by using airborne lidar (ALS) combined with satellite imagery and validated through ground-truthed field work to identify post high-severity fire vegetation compositions. ALS technology provides a large amount of high-quality data in a timely and cost-effective manner to monitor long-term and large-scale structural changes (Lefsky et al., 2002; Reutebuch et al., 2005; Kane et al. 2010a; White et al., 2013). Metrics derived from 3D point clouds provide a description of structural complexity (rumple), canopy cover, dominant canopy height (P95), individual tree detection, and tree clumps or tree approximate objects (TAOs) and many others that correlate with field-based measurements (Kane et al., 2010b; Kane et al. 2019; Jeronimo et al., 2018). With increased processing power, data availability and novel developments in research methods, this technology enables land managers to prioritize certain locations for forest treatment efforts in the years following wildfire.
+
+The methods introduced in this paper will allow land managers to map the extent of long-term post-fire vegetation compositions for further analysis of high-risk type conversion areas, prioritizing sites for tree planting, and regeneration successes and failures on a landscape scale. The goals of this study are to 1) establish a remote sensing method that identifies post high-severity fire vegetation types (conifer, oak, shrub) 6+ years after fire in Yosemite National Park and 2) test the accuracy of the method using validated field data. This allows access to information from inaccessible areas and multiple points in time, opening an entirely new avenue to study post-fire vegetation composition.  
+
+In mapping the spatial extent of post-fire successional vegetation, several important research questions emerge: 
+
+   1) How accurately can remote sensing classify post-fire vegetation types in comparison to ground-truth field data? Understanding this will improve the reliability of remote sensing techniques, especially in remote or inaccessible areas. 
+
+   2) What spatial patterns of vegetation type conversion occur in high severity burn areas, and which locations are most vulnerable to failure in forest regeneration? Evaluating and mapping areas of likely vegetation conversion can identify priority areas for restoration efforts.
+
+# Materials and Methods
+
+## Study Area
+
+This study focuses on all resultant high-severity fire patches on the West Slope of Yosemite National Park (YOSE) that occurred more than six years prior to the 2019 Yosemite lidar acquisition (YOSE MAP). The threshold of six years was chosen to include high-severity patches from the 2013 Rim Fire, which is significant in that it has large, contiguous patches of high severity that may be experiencing type conversion. This area is dominated by mixed-conifer and pine forests, including species such as ponderosa pine (Pinus ponderosa), sugar pine (Pinus lambertiana), incense cedar (Calocedrus decurrens), white fir (Abies concolor), California black oak (Quercus kelloggii), and Douglas fir (Pseudotsuga menziesii). After high-severity fires, defined as satellite imagery that estimates that the dominant forest cover is removed by over 75%, the remaining vegetation structure is often standing dead snags and open ground. In the years following the fire event, early successional species such as whitethorn (Ceonothus spp.), manzanita (Arctostaphylos spp.), and oaks establish themselves as the dominant vegetation, with conifer regeneration returning to some sites. 
+
+```{r yose-studyArea, echo=FALSE, fig.cap="Study area of high-severity fire patches on the West Slope of YOSE", out.width="70%"}
+knitr::include_graphics("G:/REGEN/Images/YOSE_StudyArea.png")
+```
+
+## Field Sampling
+
+Field sampling was conducted to ground-truth vegetation locations during the summers of 2022 and 2023. A total of 123 plots were recorded that represent 16 different fires, 4,200 to 8,000 ft of elevation, and 6-36 years since fire. These plots were chosen through a stratified random sample of lidar metrics representing diverse forest structure, such as number of tree approximate objects (TAOs), dominant canopy height (P95), live crown (P25), number of snags, and canopy cover of the 2-4m height strata. 	
+
+The sampling framework was adapted from Pokswinski et al. (2021) to validate terrestrial (TLS) and airborne (ALS) lidar scans. First, a TLS scan was taken with a Leica BLK 360 at the center of a 20m diameter plot with a target 12m north of the plot center. A JAVAD GNSS receiver was also used to record the center location of the plot with sub-meter accuracy. Then, point intercept samples of vegetation types (woody shrub, graminoid, litter, etc.) were taken 1m apart on the north-south transect (Figure 5). This allowed us to estimate percent cover of shrubs. 
+
+In addition to the point-intercept sampling, tree species, tree height, and counts were recorded for each quadrant of the plot for oaks and conifers. Trees were only recorded if they were emergent from the understory cover. For example, if there was a tree present but it did not overtop the dominant understory it was omitted, as ALS would not be able to differentiate the vegetation type. Emergent conifers were only recorded if they were non-cone bearing, indicating their juvenile tree status. 
+
+```{r plot-layout, echo=FALSE, fig.cap="Plot layout from Pokswinski et al. 2021", out.width="%"}
+knitr::include_graphics("G:/REGEN/Images/plotLayout.png")
+```
+
+## Remote Sensing Datasets (Inputs)
+
+Airborne lidar for Yosemite was collected in October 2019 and covered approximately 803,000 acres within and adjacent to the park using a Riegl VQ-1560i laser scanner. The acquisition achieved an average first return point density of ~23 pts/m² across the project area, and much higher densities (≥60 points/m²) in steep, high-profile terrain such as Yosemite Valley, El Capitan, and Half Dome to minimize shadowing effects. The survey and its processing meets USGS 3DEP Quality Level 1 standards and provides sufficient detail to characterize post-fire understory structure. 
+
+Following vendor delivery, additional pre-processing was conducted in CloudCompare, which involved registering the terrestrial laser scanning (TLS) plots to the airborne lidar (ALS) dataset. TLS scans were projected to their recorded locations using data from the JAVAD GNSS receiver and then co-registered with the ALS point cloud, from which the exact coordinates of each plot were extracted for analysis. 
+
+Prior to modeling vegetation types, ALS point clouds were filtered to isolate understory vegetation using a combination of established and novel methods. A key challenge in calculating understory metrics is occlusion from overstory trees, but by focusing on high-severity fire patches (≥75% overstory mortality) alongside high-resolution lidar, canopy interference was substantially reduced. Snags and surviving trees, however, remained visible in the point cloud and were removed, as their presence would influence understory structural metrics. 
+
+In addition to lidar data, we used Sentinel-2 imagery (Copernicus mission) from June 2022 (peak growing season) and October 2022 (onset of senescence) to minimize snow cover effects. Snow cover has been used to detect conifer presence (Menick et al., 2024), but the vegetation in this study was too short to emerge above the snowpack. Seasonal differences were calculated by subtracting October from June reflectance values. Bands 1 and 10 were excluded due to their restriction to atmospheric aerosols. Vegetation indices, including the Normalized Difference Vegetation Index (NDVI) and Normalized Difference Infrared Index (NDII), were calculated for each season and for the seasonal difference. These datasets were then used to generate the structural and spectral metrics described in the following section.
+
+## Statistical Analysis
+
+### Deriving Understory Structure Metrics
+
+Airborne LiDAR technology provides us with a large amount of high-quality data in a timely and cost-effective manner to monitor long-term structural changes (Kane et al. 2010b). Traditional forestry metrics derived from 3D point clouds provide a description of structural complexity (rumple), canopy cover, dominant canopy height (P95), surface vegetation metrics, individual tree detection, and tree clumps or tree approximate objects (TAOs) that correlate with field-based measurements (Kane et al, 2010a; Kane et al. 2019; Jeronimo et al, 2018).  
+
+In this study, we introduce metrics used in machine learning object identification produced from the point_metrics() function in the lidR package. These metrics quantify the 3D geometry of vegetation by examining the relationships among points in local neighborhoods and include planarity, linearity, anisotropy, curvature and sphericity (METRIC TABLE). Furthermore, metrics that describe the relative contribution of vertical versus horizontal structure of vegetation were produced using the minimum eigenvalue, median eigenvalue, and maximum eigenvalue from principal component analysis of the point distribution (Lucas et al. 2019).
+
+These emtrics were calculated on both the entire understory structure and segmented TAOs. The TAO segmentation method used is from Silva2016 in the lidR package. .... MORE ON THIS....
+
+```{r tao-comp, echo = FALSE, eval = FALSE}
+
+# tao_df = csv[,c(2:4, 55:58)]
+# tao_df$allCounts = tao_df$oakcount + tao_df$regencount
+# 
+# x <- tao_df$allCounts
+# y <- tao_df$totalNtaos
+# 
+# # Clamp axes to [0, max] and remove padding
+# r <- range(c(0, x, y), na.rm = TRUE)
+# 
+# plot(x, y,
+#      xlim = r, ylim = r,
+#      xaxs = "i", yaxs = "i",
+#      xlab = "allCounts", ylab = "totalNtaos segmented")
+# 
+# # 1:1 reference
+# abline(a = 0, b = 1, lwd = 2, lty = 2)
+# 
+# # Linear fit
+# fit <- lm(y ~ x, na.action = na.exclude)
+# abline(fit, lwd = 2)
+# 
+# # Legend (with R^2)
+# leg_txt <- sprintf("Linear fit (R² = %.2f)", summary(fit)$r.squared)
+# legend("topleft",
+#        legend = c("1:1 line", leg_txt),
+#        lty = c(2, 1), lwd = c(2, 2),
+#        bty = "n", inset = 0.02)
+
+```
+
+```{r fir-pine-plot, echo = FALSE, warning = FALSE}
+
+# sp_data = read.csv("G:\\REGEN\\Plot_Level_Datasets\\FieldData_LongFormat.csv")
+# 
+# species_map <- c(
+#   "ABCO (White Fir)"      = "fir",
+#   "ABMA (Red Fir)"        = "fir",
+#   "PILA (Sugar Pine)"     = "pine",
+#   "PIPO (Ponderosa pine)" = "pine",
+#   "PIJE (Jeffery Pine)"   = "pine"
+# )
+# 
+# # df is your long dataframe with columns: species, plot, nTrees, (heightBin, etc.)
+# df_sub <- sp_data[sp_data$species %in% names(species_map), ]
+# df_sub$group <- unname(species_map[match(df_sub$species, names(species_map))])
+# 
+# # Ensure counts are numeric
+# df_sub$nTrees <- as.numeric(df_sub$nTrees)
+# 
+# ## --- 2) Sum counts by plot & group (across all height bins) ---
+# agg <- aggregate(nTrees ~ plot + group, data = df_sub, FUN = sum, na.rm = TRUE)
+# 
+# ## --- 3) Ensure all plot x group combos exist (fill missing with 0) ---
+# plots  <- unique(df_sub$plot)
+# groups <- c("fir", "pine")
+# all_combos <- expand.grid(plot = plots, group = groups, stringsAsFactors = FALSE)
+# agg_full <- merge(all_combos, agg, by = c("plot", "group"), all.x = TRUE)
+# agg_full$nTrees[is.na(agg_full$nTrees)] <- 0
+# 
+# ## --- 4) Go wide: one row per plot with fir & pine columns ---
+# # Use xtabs to avoid tidyverse
+# tab <- xtabs(nTrees ~ plot + group, data = agg_full)
+# wide <- as.data.frame.matrix(tab)
+# wide$plot <- rownames(wide)
+# # Make sure columns exist even if one group was entirely absent
+# if (!"pine" %in% names(wide)) wide$pine <- 0
+# if (!"fir"  %in% names(wide)) wide$fir  <- 0
+# rownames(wide) <- NULL
+# 
+# ## --- 5) Scatter: Pines on X, Firs on Y ---
+# library(ggplot2)
+# 
+# p <- ggplot(wide, aes(x = pine, y = fir)) +
+#   geom_point(size = 2) +
+#   geom_abline(slope = 1, intercept = 0, linetype = 2) +  # 1:1 line
+#   coord_equal(expand = TRUE) +
+#   labs(
+#     title = "Per-Plot Fir vs Pine Stem Counts",
+#     x = "Pine stems (PILA + PIPO + PIJE)",
+#     y = "Fir stems (ABCO + ABMA)"
+#   ) +
+#   theme_minimal(base_size = 12)
+# 
+# print(p)
+
+```
+
+```{r all-tree-plot, , echo = FALSE, warning = FALSE}
+sp_data = read.csv("G:\\REGEN\\Plot_Level_Datasets\\FieldData_LongFormat.csv")
+coords <- read.csv("G:\\REGEN\\Plot_Level_Datasets\\BaseDF_10-18_USEABLE.csv")
+elev = rast("\\\\172.25.182.82\\pfc-frl\\01_LiDAR_data\\Processed_Lapis\\yose_2019\\yose\\Topography\\yose_MeanElevation_Meters.tif")
+
+
+pts <- vect(coords, geom = c("x","y"), crs = crs(elev))
+
+# Sample DEM
+elev_vals <- terra::extract(elev, pts)[, 2]  # second column is the raster value
+coords$elev <- elev_vals
+
+## Optional sanity check: which plots fell outside DEM (NA elevation)?
+# print(coords[is.na(coords$elev), c("plot","x","y")])
+
+## ----------------------------------------
+## 2) Aggregate trees to plot × species
+## ----------------------------------------
+sp_data$nTrees <- as.numeric(sp_data$nTrees)
+
+# Sum across height bins
+agg <- aggregate(nTrees ~ plot + species, data = sp_data, FUN = sum, na.rm = TRUE)
+
+# Keep only positive counts (0s won’t show)
+agg <- agg[agg$nTrees > 0, ]
+
+## ----------------------------------------
+## 3) Join coords (elevation + time since fire)
+## ----------------------------------------
+# Your time-since-fire field is "SinceFire"
+keep_cols <- intersect(c("plot","elev","SinceFire"), names(coords))
+dat <- merge(agg, coords[, keep_cols], by = "plot", all.x = TRUE)
+
+# Clean types
+dat$SinceFire <- as.numeric(dat$SinceFire)
+dat$elev      <- as.numeric(dat$elev)
+
+# Drop rows missing either axis
+dat <- dat[!is.na(dat$SinceFire) & !is.na(dat$elev), ]
+
+## ----------------------------------------
+## --- Clean species, build per-species palette by taxon bucket ---
+dat$species <- as.character(dat$species)
+dat$species[is.na(dat$species)] <- "Unknown"
+
+## --- 1) Reproducible X-jitter for time-since-fire (X only) ---
+set.seed(42)
+jit_width <- 3
+dat$SinceFire_j <- dat$SinceFire + runif(nrow(dat), -jit_width, jit_width)
+
+## --- 2) Manual color palette (EDIT THESE HEX CODES AS YOU LIKE) ---
+# Put every species you care about here; anything not listed gets a neutral gray.
+manual_cols <- c(
+  "PIPO (Ponderosa pine)"  = "#13B6B3",  # cool teal
+  "PIJE (Jeffery Pine)"    = "#0F8CD8",  # cool blue
+  "PICO (Lodgepole Pine)"  = "#7B61FF",  # PURPLE
+  "PILA (Sugar Pine)"      = "#14C1A7",  # cool green-teal
+  "SEGI (Sequoia)"         = "#8E8E8E",  # neutral
+  "CADE (Incense Cedar)"   = "red3",  # warm orange-red
+  "ABCO (White Fir)"       = "forestgreen",  # cool blue
+  "ABMA (Red Fir)"         = "darkgreen",  # deeper cool blue
+  "TSME (Douglas Fir)"     = "#3A80D1",  # cool blue
+  "QUKE (Black Oak)"       = "#F29E4C",  # warm orange
+  "QUCH (Canyon Live Oak)" = "#F07126",  # warm orange-red
+  "UNKN (Unknown)"         = "#AAAAAA",  # neutral gray (if you use this code)
+  "Unknown"                = "#AAAAAA"   # neutral gray (for NA->"Unknown")
+)
+
+## --- 3) Build final palette for the species actually present ---
+sp_levels <- sort(unique(dat$species))
+pal <- rep("#BFBFBF", length(sp_levels))    # default neutral gray for any not specified
+names(pal) <- sp_levels
+overlap <- intersect(names(manual_cols), sp_levels)
+pal[overlap] <- manual_cols[overlap]
+
+## Optional: quickly see which species are still using default gray
+unassigned <- setdiff(sp_levels, names(manual_cols))
+if (length(unassigned)) {
+  message("Using default gray for: ", paste(unassigned, collapse = ", "))
+}
+# 
+# ## --- 4) Plot (SinceFire on X with jitter, Elevation on Y) ---
+p = ggplot(dat, aes(x = SinceFire_j, y = elev, color = species, size = nTrees)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = pal, drop = FALSE, name = "Species") +
+  scale_size_area(name = "Trees", max_size = 8) +
+  scale_x_continuous(
+    breaks = c(5, 10, 15, 20, 25, 30, 35),  # your requested labels (added 35 so it's not duplicated)
+    labels = c(5, 10, 15, 20, 25, 30, 35)
+  ) +
+  labs(
+    title = "Trees by Species across Time Since Fire and Elevation",
+    x = "Time since fire (years)",
+    y = "Elevation (m)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+
+
+The dominant understory canopy heights of the plots ranged from less than 1 m to 16 m, with regeneration occurring at various heights. This variability limits the use of a single height stratum for detecting relevant objects, as has been done in other lidar modeling methods (Zellweger et al, 2013; Venier et al, 2019; Ferrara et al, 2023). Therefore, metrics were calculated between point height percentiles rather than specific strata. The height percentiles (denoted here by “P” followed by the percentile number) chosen were P55-P85 (representing mid layer of the understory canopy), P85-P95 (representing the mid- top layer of the understory canopy), and P90-P99 (representing emergent objects from the understory layer). The final matrix included a total of 48 metrics to choose from.
+
+Seasonal differences from the June and October Sentinel II Imagery were calculated by subtracting October from June reflectance values. Bands one and ten were excluded because they are primarily sensitive to atmospheric aerosols and do not provide information on vegetation. Spectral vegetation indices, including the Normalized Difference Vegetation Index (NDVI) and Normalized Difference Infrared Index (NDII), were calculated for each season and for the seasonal difference.
+
+```{r variable-table-compelte, echo = FALSE, warning = FALSE}
+veg_metrics <- data.frame(
+  Metric = c(
+    # ---- Eigenvalue-based ----
+    "λ1 (largest eigenvalue)",
+    "λ2 (middle eigenvalue)",
+    "λ3 (smallest eigenvalue)",
+    "λ1 >> λ2 ≈ λ3 (Linearity)",
+    "λ1 ≈ λ2 >> λ3 (Planarity)",
+    "λ1 ≈ λ2 ≈ λ3 (Scatter / Sphericity)",
+    "Sum of eigenvalues",
+    "Curvature (λ3 / (λ1+λ2+λ3))",
+    # ---- Calculated Metrics ----
+    "Rumple",
+    "25th Percentile Height",
+    "75th Percentile Height",
+    "95th Percentile Height",
+    "Interquartile Range",
+    "Mean Height",
+    "Standard Deviation of Height",
+    "Number of Shrub Approximate Objects (SAOs)",
+    # ---- Height percentiles ----
+    "p75–85",
+    "p85–95",
+    "p90–99",
+    # ---- Sentinel-2 NDVI ----
+    "NDVI (June – Growing Season)",
+    "NDVI (October – Senescence)",
+    "NDVI (June − October)",
+    # ---- Sentinel-2 NDII ----
+    "NDII (June – Growing Season)",
+    "NDII (October – Senescence)",
+    "NDII (June − October)"
+  ),
+  Category = c(
+    rep("Eigenvalue point metrics,", 8),
+    rep("Calculated Lidar Metrics", 8),
+    rep("Height percentile", 3),
+    rep("Spectral (Sentinel-2)", 6)
+  ),
+  Mathematical_Meaning = c(
+    # ---- Eigenvalue-based ----
+    "Variance along dominant axis",
+    "Variance along second axis",
+    "Variance along minor axis (normal vector direction)",
+    "Strong elongation along one axis",
+    "Spread along two axes, little along the third",
+    "Even spread along all three axes",
+    "Total variance in all directions",
+    "Proportion of spread in smallest axis",
+    # ---- Calculated Metrics ----
+    "Ratio of canopy surface area to ground area",
+    "The height below which 25% of lidar returns occur",
+    "the height below which 75% of lidar returns occur",
+    "the height below which 95% of lidar returns occur",
+    "P25 subtracted from p95",
+    "Avereage vegetation height",
+    "Verticle heterogeneaity",
+    "Number of SAOs segmented using silva2016()",
+    # ---- Height percentiles ----
+    "Returns between 75th–85th height percentiles",
+    "Returns between 85th–95th height percentiles",
+    "Returns between 90th–99th height percentiles",
+    # ---- Sentinel-2 NDVI ----
+    "Normalized (NIR − Red) / (NIR + Red): greenness proxy in June",
+    "Normalized (NIR − Red) / (NIR + Red): greenness proxy in Oct",
+    "Difference in NDVI: June minus October",
+    # ---- Sentinel-2 NDII ----
+    "Normalized (NIR − SWIR) / (NIR + SWIR): canopy water/structure proxy in June",
+    "Normalized (NIR − SWIR) / (NIR + SWIR): canopy water/structure proxy in Oct",
+    "Difference in NDII: June minus October"
+  ),
+  Ecological_Interpretation = c(
+    # ---- Eigenvalue-based ----
+    "Strength of vertical or horizontal elongation. High λ1 = strong stems/saplings or aligned branches; low λ1 = sparse/no dominant structure",
+    "Secondary spread; larger when planar shrub/leaf layers are present",
+    "Layer thickness; Very small λ3 = flat surfaces (leaves, shrub canopy); larger λ3 = diffuse/volumetric fill",
+    "Stem- or branch-like elements (snags, taller objects)",
+    "Flat layers (shrub canopies, understory foliage mats)",
+    "Bushy shrubs, tangled regrowth, volumetric clumps",
+    "Overall density / structural richness of vegetation",
+    "Boundary sharpness; distinguishes open gaps vs solid vegetation",
+    # ---- Calculated Metrics ----
+    "Vegetation struture roughness",
+    "Height to lvie crown (Canopy base height)",
+    "75th Percentile Height",
+    "Dominant canopy height",
+    "Difference in height to live crown and dominant canopy height",
+    "Mean Height of vegetation",
+    "Variability of vegetation structure",
+    "SAO density per 20mx20m cell",
+    # ---- Height percentiles ----
+    "Low–mid understory canopy",
+    "Mid–upper understory canopy",
+    "Emergent objects from understory canopy",
+    # ---- Sentinel-2 NDVI ----
+    "Leaf-on vigor; higher values indicate greener, photosynthetically active understory/low canopy in June",
+    "Leaf-off/aging foliage; lower values reflect senescence and reduced greenness in October",
+    "Seasonality of greenness; larger positive = much greener in June (deciduous signal), near-zero = evergreen/persistent cover or non-veg",
+    # ---- Sentinel-2 NDII ----
+    "Higher canopy water content/denser foliage signals in June",
+    "Reduced water content/drier foliage during senescence in October",
+    "Seasonal drying; larger positive = greater drying from June to October (fuel aridity/availability signal)"
+  ),
+  stringsAsFactors = FALSE
+)
+
+kable(veg_metrics,
+      format = "pipe",
+      caption = "Metric Summary")
+
+```
+
+
+### Hurdle Model Framework
+
+```{r methods-scematic, echo=FALSE, fig.cap="Methods pipeline detailing each step.", out.width="120%"}
+knitr::include_graphics("G:/REGEN/Images/flowchart.png")
+```
+
+#### Logistic regression (presence/absence).
+
+Binary logistic regression models predict the probability of presence/absence data based on independent variables (Preisser et al, 2014; Smith et al, 2019). The binary logistic model allows for a straightforward interpretation of predictor variables as they influence the likelihood of vegetation presence. By identifying presence and absence probabilities, this model determines whether further modeling is required to quantify vegetation densities or if areas can be classified as lacking the specific vegetation composition. This stage effectively “hurdles” the model over the zero inflated data to assess conifer and oak amounts in the following model.
+
+Variable reduction was essential to the success of the models to reduce overfitting. Many of the variables calculated are not easy to visualize in the point clouds, therefore a standardized variable selection was necessary. Logistic regression allows for the Akaike Information Criterion (AIC) to identify the best goodness-of-fit for all variables. Hirotugu Akaike (1973) developed this method to assist in model selection for the model that best explains the variability in the data with the fewest parameters, aiming to avoid overfitting. We tested all combinations of the variables (up to 5 variables per combination) to find the best fit for each.
+
+
+#### Ordinal logistic regression (abundance class).
+
+
+
+For the second stage of the hurdle model, an ordinal logistic regression is an appropriate choice given that the goal is to predict “goldilocks” measurements of vegetation density (low, medium, and high) (Harrell, 2015). Unlike standard linear models, which assume a continuous response, ordinal logistic regression accommodates the natural ordering in the density categories without assuming equal spacing between them. This model accounts for differences in predictor relationships across varying density levels, capturing subtle gradients in environmental variables that may correspond differently to low versus high vegetation densities.
+
+Variable selection for the ordinal logistic regression (OLR) models followed a different approach than the logistic regression described above. OLR models relied exclusively on structural lidar metrics, as spectral predictors consistently degraded performance and introduced instability. Because the goal was to model abundance classes, we required a framework that could fit a semi-parallel model, where most variables share a common slope but a subset are allowed to vary between class thresholds. This approach accommodates situations where the factors distinguishing low from medium abundance differ from those distinguishing medium from high.
+
+Traditional AIC-based selection was not feasible here due to the limited sample size, the inclusion of parallel and non-parallel terms, and additional model tuning requirements. Instead, we used the ordinalnetCV() function from the ordinalNet package, which applies elastic net regularization to balance variable selection and shrinkage. This method combines lasso and ridge penalties to improve model stability while identifying the most informative predictors. Models were trained with five-fold cross-validation, and lambda values were chosen to minimize misclassification error. The output provided a ranked list of usable metrics based on their lambda values, from which final predictors were selected.
+
+
+
+
+```{r print-vars, echo = FALSE}
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#                             VARIABLES
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# LOGISTIC REG
+
+con_lr_vars <- attr(terms(as.formula(con_result$best_formula)), "term.labels")
+oak_lr_vars <- attr(terms(as.formula(oak_result$best_formula)), "term.labels")
+shrub_lr_vars <- attr(terms(as.formula(shr_result$best_formula)), "term.labels")
+
+# ORDINAL LOGISTIC REG
+con_OLR_model <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\con_OLR_model_%s.rds", date))
+oak_OLR_model <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\oak_OLR_model_%s.rds", date))
+shr_OLR_model <- readRDS(sprintf("G:\\REGEN\\Plot_Level_Products\\Models\\shr_OLR_model_%s.rds", date))
+
+con_coefs <- coef(con_OLR_model$fit, whichLambda = which.min(con_OLR_model$misclass), matrix = TRUE)
+con_OLR_vars <- rownames(con_coefs)[apply(con_coefs, 1, function(x) any(x != 0))]
+con_OLR_vars <- con_OLR_vars[con_OLR_vars != "(Intercept)"]
+con_OLR_fit = con_OLR_model$fit
+con_mu = con_OLR_fit$colMeans
+con_sg = con_OLR_fit$colSDs
+con_sg[is.na(con_sg) | con_sg == 0] <- 1 
+
+oak_coefs <- coef(oak_OLR_model$fit, whichLambda = which.min(oak_OLR_model$misclass), matrix = TRUE)
+oak_OLR_vars <- rownames(oak_coefs)[apply(oak_coefs, 1, function(x) any(x != 0))]
+oak_OLR_vars <- oak_OLR_vars[oak_OLR_vars != "(Intercept)"]
+oak_OLR_fit = oak_OLR_model$fit
+oak_mu = oak_OLR_fit$colMeans
+oak_sg = oak_OLR_fit$colSDs
+oak_sg[is.na(oak_sg) | oak_sg == 0] <- 1 
+
+shrub_coefs <- coef(shr_OLR_model$fit, whichLambda = which.min(shr_OLR_model$misclass), matrix = TRUE)
+shrub_OLR_vars <- rownames(shrub_coefs)[apply(shrub_coefs, 1, function(x) any(x != 0))]
+shrub_OLR_vars <- shrub_OLR_vars[shrub_OLR_vars != "(Intercept)"]
+shr_OLR_fit = shr_OLR_model$fit
+shr_mu = shr_OLR_fit$colMeans
+shr_sg = shr_OLR_fit$colSDs
+shr_sg[is.na(shr_sg) | shr_sg == 0] <- 1 
+
+# BETA REG
+br_vars = best_row
+```
+
+```{r conifer-predict, echo=FALSE}
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#                             PREDICTIONS
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# Predict class labels on training data
+con_predicted_class <- predict(
+  olr$,
+  newx = scale(con_X_reduced),
+  whichLambda = which.min(con_OLR_model$misclass),
+  type = "class"
+)
+
+# Confusion matrix
+#table(Observed = y, Predicted = predicted_class)
+level_labels <- c("Low", "Medium", "High")
+
+con_y <- factor(conifer_ord_DF$success, levels = level_labels, ordered = TRUE)
+con_predicted_class <- factor(con_predicted_class, 
+                          levels = 1:3, 
+                          labels = level_labels, 
+                          ordered = TRUE)
+conCM = confusionMatrix(data = con_predicted_class, reference = con_y)
+#conCM
+
+con_predClass = as.data.frame(con_predicted_class)
+con_predClass$regenCL = conifer_ord_DF$success
+con_predClass$plotID = conifer_ord_DF$plot
+```
+
+```{r oak-predict, echo=FALSE}
+# Predict class labels on training data
+predicted_class <- predict(
+  oak_OLR_model$fit,
+  newx = scale(oak_X_reduced),
+  whichLambda = which.min(oak_OLR_model$misclass),
+  type = "class"
+)
+
+y <- factor(oak_OLR_DF$success, levels = level_labels, ordered = TRUE)
+predicted_class <- factor(predicted_class, 
+                          levels = 1:3, 
+                          labels = level_labels, 
+                          ordered = TRUE)
+oakCM = confusionMatrix(data = predicted_class, reference = y)
+#oakCM
+
+oak_predClass = as.data.frame(predicted_class)
+oak_predClass$regenCL = oak_OLR_DF$success
+oak_predClass$plotID = oak_OLR_DF$plot
+```
+
+```{r shrub-predict, echo=FALSE}
+
+train = csv[,c(1,4:ncol(csv))]
+colnames(train)[2] = "success"
+train = subset(train, success >= 0.01)
+
+final_BR_model <- betareg::betareg(form, data = train)
+BR_preds = predict(final_BR_model, type = "response")
+BR_preds_class = ifelse(BR_preds < 0.4, "Low", 
+                       ifelse(BR_preds >= 0.4 & BR_preds < 0.65, "Medium",
+                              ifelse(BR_preds >= 0.65, "High", "NA")))
+BR_preds_class <- factor(BR_preds_class, levels = c("Low","Medium", "High"), ordered = TRUE)
+
+# # Predict class labels on training data
+# predicted_class <- predict(
+#   shr_OLR_model$fit,
+#   newx = scale(shrub_X_reduced),
+#   whichLambda = which.min(shr_OLR_model$misclass),
+#   type = "class"
+# )
+
+y <- factor(shrub_OLR_DF$success, levels = level_labels, ordered = TRUE)
+
+#y = train$success
+# predicted_class <- factor(predicted_class, 
+#                           levels = 1:3, 
+#                           labels = level_labels, 
+#                           ordered = TRUE)
+shrubCM = confusionMatrix(data = BR_preds_class, reference = y)
+#shrubCM
+
+shrub_predClass = as.data.frame(BR_preds_class)
+shrub_predClass$regenCL = train$success
+shrub_predClass$plotID = train$plot
+```
+
+```{r shrub_resids, echo = FALSE, eval = FALSE, fig.height=8, fig.width=6}
+
+#------------------------------------------------------------------------------
+# Residuals
+#------------------------------------------------------------------------------
+
+y <- train$success  # replace
+n <- length(y)
+y_star <- (y * (n - 1) + 0.5) / n
+
+train2 <- train
+train2$success <- y_star
+
+final_BR_model <- betareg::betareg(form, data = train2)
+
+# Extract residuals
+res <- residuals(final_BR_model, type = "pearson")   # or type = "deviance", "response"
+
+# Basic histogram
+#hist(res, breaks = 20, main = "Histogram of Residuals", xlab = "Residuals")
+
+# Residuals vs Fitted
+# plot(predict(final_model, type = "response"), res,
+#      main = "Residuals vs Fitted Values",
+#      xlab = "Fitted Values", ylab = "Residuals")
+# abline(h = 0, col = "red", lty = 2)
+
+# # Q-Q plot for residuals
+# qqnorm(res)
+# qqline(res, col = "blue")
+
+par(mfrow = c(3, 2))
+suppressWarnings(RNGversion("3.5.0"))
+set.seed(123)
+plot(final_BR_model, which = 1:4, type = "pearson")
+plot(final_BR_model, which = 5, type = "deviance", sub.caption = "")
+plot(final_BR_model, which = 1, type = "deviance", sub.caption = "")
+par(mfrow = c(1, 1))
+
+
+
+#-----------------------------------------------------------------------------
+# FIND HIGH PREFORMING VARIABLES
+# Extract diagnostics
+cd   <- cooks.distance(final_BR_model)                 # Cook's distance
+lev  <- hatvalues(final_BR_model)                      # Generalized leverage
+resP <- residuals(final_BR_model, type = "pearson")    # Pearson residuals
+resD <- residuals(final_BR_model, type = "deviance")   # Deviance residuals
+fit  <- predict(final_BR_model, type = "response")     # Fitted values
+
+n <- length(resP)
+p <- length(coef(final_BR_model)) 
+
+# Define thresholds
+cook_threshold <- 4 / n
+lev_threshold  <- 2 * p / n
+res_threshold  <- 2  # abs(Pearson residual)
+
+# Build table
+diagnostics <- data.frame(
+  row = seq_len(n),
+  fitted = fit,
+  pearson_resid = resP,
+  deviance_resid = resD,
+  leverage = lev,
+  cooks_distance = cd,
+  flag_cook = cd > cook_threshold,
+  flag_leverage = lev > lev_threshold,
+  flag_resid = abs(resP) > res_threshold
+)
+
+diagnostics$flag_any <- diagnostics$flag_cook | diagnostics$flag_leverage | diagnostics$flag_resid
+
+# View top rows with any flags
+#print(diagnostics[diagnostics$flag_any, ])
+```
+
+```{r shrub-pred-diff-df, echo = FALSE, warning=FALSE}
+#--------------------------------------------------------------------------------
+# ADD PREDICTIONS TO THEIR OWN DF
+
+fit <- predict(final_BR_model, type = "response")
+
+shrub_pred_df = train[, c("plot", "success")]
+shrub_pred_df$predictions = fit
+
+shrub_pred_df$pred_diff = shrub_pred_df$success - shrub_pred_df$predictions
+names(shrub_pred_df) = c("plotID", "shrub_obsPerc", "shrub_predPerc", "shrub_PredDiff")
+
+# Example: observed vs predicted from CV
+obs   <- shrub_pred_df$shrub_obsPerc
+preds <- shrub_pred_df$shrub_predPerc
+
+# Define tolerance (0.2)
+tol <- mean_mae
+
+# Accuracy: proportion of predictions within tolerance
+beta_acc <- mean(abs(preds - obs) <= tol, na.rm = TRUE)
+```
+
+```{r master_df, echo = FALSE,warning=FALSE}
+master_pred = csv[, c("plot", "oakcount", "regencount", "shrub.percentages")]
+names(master_pred) <- c("plot", "oakcount", "regencount", "shrub_percentages")
+
+master_pred = merge(master_pred, con_predClass, by.y = "plotID", by.x = "plot", all = TRUE)
+names(master_pred) <- c("plot", "oakcount", "regencount", "shrub_percentages", "con_predClass", "con_obsClass")
+
+master_pred = merge(master_pred, oak_predClass, by.y = "plotID", by.x = "plot", all = TRUE)
+names(master_pred) <- c("plot", "oakcount", "regencount", "shrub_percentages", 
+                        "con_predClass", "con_obsClass", 
+                        "oak_predClass", "oak_obsClass")
+#master_pred <- master_pred[!duplicated(master_pred$plotID), ]
+
+master_pred = merge(master_pred, shrub_predClass, by.y = "plotID", by.x = "plot", all = TRUE)
+names(master_pred) <- c("plot", "oakcount", "regencount", "shrub_percentages", 
+                        "con_predClass", "con_obsClass", 
+                        "oak_predClass", "oak_obsClass", 
+                        "shrub_predClass", "shrub_obsClass")
+
+master_pred = merge(master_pred, shrub_pred_df, by.y = "plotID", by.x = "plot", all = TRUE)
+#master_pred <- master_pred[!duplicated(master_pred$plotID), ]
+
+```
+
+```{r add-log-reg, echo = FALSE,warning=FALSE}
+
+# ----------------------------------------------------
+# 1. Make your logistic predictions (per taxon)
+# ----------------------------------------------------
+# Example for conifers:
+con_glm <- glm(formula(con_result$best_formula), data = coniferDF, family = binomial)
+coniferDF$log_pred <- predict(con_glm, coniferDF, type = "response")
+coniferDF$log_predClass <- ifelse(coniferDF$log_pred > 0.55, "present", "none")
+
+# Do the same for oak
+oak_glm <- glm(formula(oak_result$best_formula), data = oakDF, family = binomial)
+oakDF$log_pred <- predict(oak_glm, oakDF, type = "response")
+oakDF$log_predClass <- ifelse(oakDF$log_pred > 0.5, "present", "none")
+
+# And for shrubs (note threshold 0.7 from your loop)
+shr_glm <- glm(formula(shr_result$best_formula), data = shrubDF, family = binomial)
+shrubDF$log_pred <- predict(shr_glm, shrubDF, type = "response")
+shrubDF$log_predClass <- ifelse(shrubDF$log_pred > 0.6, "present", "none")
+
+# ----------------------------------------------------
+# 2. Reduce to plot-level and keep only what you need
+# ----------------------------------------------------
+coniferDF$plotID = csv$plot
+oakDF$plotID = csv$plot
+shrubDF$plotID = csv$plot
+
+con_log <- coniferDF[, c("plotID", "log_predClass")]
+oak_log <- oakDF[, c("plotID", "log_predClass")]
+shr_log <- shrubDF[, c("plotID", "log_predClass")]
+
+names(con_log)[2] <- "con_logClass"
+names(oak_log)[2] <- "oak_logClass"
+names(shr_log)[2] <- "shrub_logClass"
+
+# ----------------------------------------------------
+#  into your master_pred table
+# ----------------------------------------------------
+master_pred <- merge(master_pred, con_log, by.y = "plotID", by.x = "plot", all = TRUE)
+master_pred <- merge(master_pred, oak_log, by.y = "plotID", by.x = "plot", all = TRUE)
+master_pred <- merge(master_pred, shr_log, by.y = "plotID", by.x = "plot", all = TRUE)
+#master_pred <- master_pred[!duplicated(master_pred$plotID), ]
+# ----------------------------------------------------
+# Overwrite ordinal predictions with "none" if log says none
+# ----------------------------------------------------
+master_pred$con_predClass   <- as.character(master_pred$con_predClass)
+master_pred$oak_predClass   <- as.character(master_pred$oak_predClass)
+master_pred$shrub_predClass <- as.character(master_pred$shrub_predClass)
+
+master_pred$con_predClass[master_pred$con_logClass == "none"]     <- "none"
+master_pred$oak_predClass[master_pred$oak_logClass == "none"]     <- "none"
+master_pred$shrub_predClass[master_pred$shrub_logClass == "none"] <- "none"
+
+# --- Make observed class columns characters so we can assign "none" safely ---
+master_pred$con_obsClass   <- as.character(master_pred$con_obsClass)
+master_pred$oak_obsClass   <- as.character(master_pred$oak_obsClass)
+master_pred$shrub_obsClass <- as.character(master_pred$shrub_obsClass)
+
+# --- Replace NA observed values with "none" ---
+master_pred$con_obsClass[is.na(master_pred$con_obsClass)]     <- "none"
+master_pred$oak_obsClass[is.na(master_pred$oak_obsClass)]     <- "none"
+master_pred$shrub_obsClass[is.na(master_pred$shrub_obsClass)] <- "none"
+master_pred$shrub_obsPerc[is.na(master_pred$shrub_obsPerc)] <- "0"
+# ----------------------------------------------------
+# Add 0s to the betaregression and percents
+# ----------------------------------------------------
+# Make sure shrub_predPerc is numeric
+master_pred$shrub_predPerc <- as.numeric(master_pred$shrub_predPerc)
+master_pred$shrub_obsPerc = as.numeric(master_pred$shrub_obsPerc)
+# Overwrite shrub_predPerc with 0 if logistic shrub model predicted "none"
+master_pred$shrub_predPerc[master_pred$shrub_logClass == "none"] <- 0
+
+master_pred$shrub_PredDiff = as.numeric(as.numeric(master_pred$shrub_obsPerc) - as.numeric(master_pred$shrub_predPerc))
+
+# Identify numeric columns in master_pred
+num_cols <- sapply(master_pred, is.numeric)
+
+# Round all numeric columns to (say) 3 significant digits
+master_pred[, num_cols] <- lapply(master_pred[, num_cols, drop = FALSE],
+                                  function(x) signif(x, digits = 3))
+# ----------------------------------------------------
+# Change to present/absentr
+# ----------------------------------------------------
+# Replace "none" with "absent" in the logistic class columns
+master_pred$con_logClass[master_pred$con_logClass == "none"]     <- "absent"
+master_pred$oak_logClass[master_pred$oak_logClass == "none"]     <- "absent"
+master_pred$shrub_logClass[master_pred$shrub_logClass == "none"] <- "absent"
+
+# coords <- unique(csv[, c("plotID","x","y")])
+# names(coords) <- c("plotID","x","y")
+# master_pred <- merge(master_pred, coords, by = "plotID", all.x = TRUE)
+```
+
+
+#### Cross-validation and model selection process.
+
+Figure 4. Hurdle model flowchart (detailed logistic + ordinal steps).
+
+
+# Results
+
+## Understory Structure Across Vegetation Types
+
+The variables retained in each model represent structural features of the understory that were identified through automated selection procedures. Although the specific metrics differ among vegetation types, together they highlight how aspects such as elongation, planarity, spread, and spectral signals influence predicted conifer amounts. Because model selection was algorithm-driven rather than manually decided, the resulting predictors reflect unbiased structural signals rather than arbitrary choices (VARIABLE DESCRIPTION TABLE).
+
+```{r pretty-names, echo = FALSE, warning=FALSE}
+pretty_names <- c(
+  "emin__TAO"      = "Vertical Compactness of TAOs",
+  "emax_TAO"       = "Verticle Elongation of TAOs",
+  "emid_55to85"    = "Low to Mid Understory Canopy Spread",
+  "emin_90to99"    = "Verticle Compactness of Emergent Objects",
+  "planar_85to95"  = "Mid to Upper Understory Canopy Planarity",
+  "linear_90to99"  = "Emergent Objects Linearity",
+  "linear_55to85"  = "Low to Mid Canopy Linearity",
+  "lin_TAO"        = "Linearity of TAOs",
+  "curv_90to99"    = "Emergent Objects Curvature",
+  "curv_TAO"       = "Curvature of TAOs",
+  "rumple_90to99"  = "Emergent Objects Rumple",
+  "zmean_55to85"   = "Low to Mid Understory Canopy Mean Height",
+  "zmean_85to95"   = "Mid to Upper Understory Canopy Mean Height",
+  "p25_85to95"     = "Mid to Upper Understory Canopy Height to Live Crown",
+  "ndvi"           = "Seasonal Difference NDVI",
+  "ndvis"          = "Growing Season NDVI",
+  "ndviw"          = "Senesence NDVI",
+  "ndirw"          = "Senesence NDII",
+  "ndirs"          = "Growing Season NDII"
+)
+```
+
+```{r variable-table-descriptions, echo = FALSE, warning=FALSE}
+variable_rows <- list()
+row_i <- 1
+
+## -----------------------------
+## Logistic Regression (GLM)
+## -----------------------------
+
+# Conifer LR
+con_lr_coefs <- con_result$best_model$coefficients
+for (v in con_lr_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Conifer",
+      ModelType   = "Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = if (v %in% names(con_lr_coefs)) unname(con_lr_coefs[v]) else NA_real_,
+      Coef_t1     = NA_real_,
+      Coef_t2     = NA_real_,
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+# Oak LR
+oak_lr_coefs <- oak_result$best_model$coefficients
+for (v in oak_lr_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Oak",
+      ModelType   = "Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = if (v %in% names(oak_lr_coefs)) unname(oak_lr_coefs[v]) else NA_real_,
+      Coef_t1     = NA_real_,
+      Coef_t2     = NA_real_,
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+# Shrub LR
+shrub_lr_coefs <- shr_result$best_model$coefficients
+for (v in shrub_lr_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Shrub",
+      ModelType   = "Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = if (v %in% names(shrub_lr_coefs)) unname(shrub_lr_coefs[v]) else NA_real_,
+      Coef_t1     = NA_real_,
+      Coef_t2     = NA_real_,
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+## --------------------------------------
+## Ordinal Logistic (ordinalNetCV models)
+## Use the coefficients at the AIC-min λ
+## --------------------------------------
+
+# Conifer OLR
+con_olr_idx   <- which.min(con_OLR_model$fit$aic)
+con_olr_coefv <- con_OLR_model$fit$coefs[con_olr_idx, ]
+for (v in con_OLR_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    base <- con_olr_coefv[v];        if (is.na(base)) base <- 0
+    d1   <- con_olr_coefv[paste0(v, ":1")]; if (is.na(d1)) d1 <- 0
+    d2   <- con_olr_coefv[paste0(v, ":2")]; if (is.na(d2)) d2 <- 0
+
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Conifer",
+      ModelType   = "Ordinal Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = base,            # parallel term
+      Coef_t1     = base + d1,       # Low vs {Med, High}
+      Coef_t2     = base + d2,       # {Low, Med} vs High
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+# Oak OLR
+oak_olr_idx   <- which.min(oak_OLR_model$fit$aic)
+oak_olr_coefv <- oak_OLR_model$fit$coefs[oak_olr_idx, ]
+for (v in oak_OLR_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    base <- oak_olr_coefv[v];        if (is.na(base)) base <- 0
+    d1   <- oak_olr_coefv[paste0(v, ":1")]; if (is.na(d1)) d1 <- 0
+    d2   <- oak_olr_coefv[paste0(v, ":2")]; if (is.na(d2)) d2 <- 0
+
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Oak",
+      ModelType   = "Ordinal Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = base,
+      Coef_t1     = base + d1,
+      Coef_t2     = base + d2,
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+# Shrub OLR
+shrub_olr_idx   <- which.min(shr_OLR_model$fit$aic)
+shrub_olr_coefv <- shr_OLR_model$fit$coefs[shrub_olr_idx, ]
+for (v in shrub_OLR_vars) {
+  if (v != "(Intercept)" && nzchar(v)) {
+    base <- shrub_olr_coefv[v];      if (is.na(base)) base <- 0
+    d1   <- shrub_olr_coefv[paste0(v, ":1")]; if (is.na(d1)) d1 <- 0
+    d2   <- shrub_olr_coefv[paste0(v, ":2")]; if (is.na(d2)) d2 <- 0
+
+    variable_rows[[row_i]] <- data.frame(
+      VegType     = "Shrub",
+      ModelType   = "Ordinal Logistic Regression",
+      Variable    = v,
+      FullName    = "",
+      Description = "",
+      Coefficient = base,
+      Coef_t1     = base + d1,
+      Coef_t2     = base + d2,
+      stringsAsFactors = FALSE
+    )
+    row_i <- row_i + 1
+  }
+}
+
+## -----------------------------
+## Combine to final table
+## -----------------------------
+variable_table <- do.call(rbind, variable_rows)
+row.names(variable_table) <- NULL
+
+# Column order (includes threshold columns for OLR)
+variable_table <- variable_table[, c("VegType","ModelType", "Variable", "FullName", "Description", "Coefficient", "Coef_t1", "Coef_t2")]
+
+## ---- Fill FullName by matching Variable ----
+idx <- match(variable_table$Variable, names(pretty_names))
+
+# only overwrite if FullName is blank
+fillable <- !nzchar(variable_table$FullName) & !is.na(idx)
+variable_table$FullName[fillable] <- unname(pretty_names[idx[fillable]])
+
+
+#variable_table
+
+```
+
+```{r table-descriptions, echo = FALSE}
+pretty_decsripts <- c("Conifers are less likely to be present in dense/tall low to midstory vegetation",
+                      "Emergent Objects with rougher, more volumetric surface have a very high chance of being conifers",
+                      "Higher NDVI indicates higher liklihood of conifer prescence",
+                      "Higher NDII indicated higher liklihood of conifer prescence",
+                      "Emergent objects with rougher, more volumetric surface have a high chance of being oaks, not as much influence as in conifer LR model",
+                      "Higher curvature of TAOs decreased the odds of oak prescence",
+                      "Higher linearity of TAOs increased the odds of oak prescence",
+                      "?? ",
+                      "The lower the NDVI in October during senescene, the lower the probability of oak prescence (likley due to deciduous oak species found in Yosemite)",
+                      "The lower the NDII (vegetation water content) in October during senescene, the lower the probability of oak prescence (likley due to deciduous oak species found in Yosemite)",
+                      "The lower the mid to upper understory height to live crown, the higher the prescence of shrubs. Shrubs do not have a large difference between the ground and their base heights.",
+                      "The higher the mid to upper understory canopy mean height, the grater the probability of shrubs presence. Likely due to the uniform shrub covers that increases mean height.",
+                      "??",
+                      "The greater the vegetation water content in June, the more likely shrubs are present",
+                      "The lower the vegetation water content in October, the less likely shrubs are present",
+                      "Greater vertical elongation of understory TAOs decreased the probability of high conifer amounts, while bushier, volumetric structures were more often linked with higher conifer presence.",
+                      "Planarity",
+                      "Cnaopy Spread",
+                      "Rumple emergent  objects",
+                      "Low to mid understory cnaopy spread",
+                      "Verticle Compactness of Emergent Objects",
+                      "Emergent Objects Linearity",
+                      "	Vertical Compactness of TAOs",
+                      "nir",
+                      "Growing Season NDVI",
+                      "	Low to Mid Understory Canopy Spread",
+                      "	Low to Mid Canopy Linearity"
+                      
+)
+```
+
+```{r add-descriptions, echo = FALSE, warning =FALSE}
+
+names(pretty_decsripts) <- names(pretty_names)[seq_along(pretty_decsripts)]
+
+## ------------------------------------------------------------
+## 3) Fill the Description column
+## ------------------------------------------------------------
+idx <- match(variable_table$Variable, names(pretty_decsripts))
+
+# Only fill blanks (if you want to preserve any existing text)
+fillable <- !nzchar(variable_table$Description) & !is.na(idx)
+variable_table$Description[fillable] <- unname(pretty_decsripts[idx[fillable]])
+
+tab <- kable(variable_table,
+             caption = "Variable Influence and Descriptions",
+             row.names = FALSE)
+
+
+```
+
+Distribution of lidar understory metrics by type.
+
+Which metrics separate conifer, oak, shrub.
+
+Figure 5. Variable distributions (boxplots/density plots).
+
+```{r, box-plot-var-fig, echo = FALSE,warning=FALSE}
+# Logistic Regression source data
+df_conLR  <- coniferDF
+df_oakLR  <- oakDF
+df_shrLR  <- shrubDF
+
+df_conOLR <- conifer_ord_DF
+df_oakOLR <- oak_OLR_DF
+df_shrOLR <- shrub_OLR_DF
+
+# (We are NOT using Beta Regression anymore.)
+
+# ============================================================
+# 2) Response column names
+# ============================================================
+resp_conLR  <- "succuess"   # binary 0/1 (fallback to 'success' handled below)
+resp_oakLR  <- "succuess"
+resp_shrLR  <- "succuess"
+
+resp_conOLR <- "success"    # ordinal (Low/Medium/High), robust recode below
+resp_oakOLR <- "success"
+resp_shrOLR <- "success"
+
+# ============================================================
+# 3) Pretty names (your mapping)
+# ============================================================
+pretty_map <- c(
+  "emin_TAO"       = "Vertical Compactness of TAOs",
+  "emax_TAO"       = "Verticle Elongation of TAOs",
+  "emid_TAO"       = "Lateral Spread of TAOs",
+  "emid_55to85"    = "Low to Mid Understory Canopy Spread",
+  "emax_55to85"    = "Low to Mid Understory Canopy Compactness",
+  "planar_90to99"  = "Emergent Objects Planarity",
+  "taos_90to99"    = "Number of Emergent TAOs",
+  "iqr_85to95"     = "Mid to Upper Understory Interquartile Range",
+  "p25_55to85"     =  "Low to Mid Understory Canopy Height to Live Crown",
+  "zsd_85to95"     = "Mid to Upper Understory Height Standard Deviation",
+  "emin_90to99"    = "Verticle Compactness of Emergent Objects",
+  "planar_85to95"  = "Mid to Upper Understory Canopy Planarity",
+  "linear_90to99"  = "Emergent Objects Linearity",
+  "linear_55to85"  = "Low to Mid Canopy Linearity",
+  "lin_TAO"        = "Linearity of TAOs",
+  "curv_90to99"    = "Emergent Objects Curvature",
+  "curv_TAO"       = "Curvature of TAOs",
+  "rumple_90to99"  = "Emergent Objects Rumple",
+  "zmean_55to85"   = "Low to Mid Understory Canopy Mean Height",
+  "zmean_85to95"   = "Mid to Upper Understory Canopy Mean Height",
+  "p25_85to95"     = "Mid to Upper Understory Canopy Height to Live Crown",
+  "seasDiff_ndvi"  = "Seasonal Difference NDVI",
+  "junendvi"       = "Growing Season NDVI",
+  "octndvi"        = "Senesence NDVI",
+  "octndir"        = "Senesence NDII",
+  "junendir"       = "Growing Season NDII"
+)
+
+# ===========================
+# Header colors (edit to taste)
+# ===========================
+header_fill_map <- list(
+  "Conifer — Logistic Regression"       = "grey65",
+  "Oak — Logistic Regression"           = "grey65",
+  "Shrub — Logistic Regression"         = "grey65",
+  "Conifer — Ordinal Logistic Reg."     = "grey65",
+  "Oak — Ordinal Logistic Reg."         = "grey65",
+  "Shrub — Beta Regression"             = "grey65"
+)
+get_header_fill <- function(model_name, map, default = "grey65") {
+  if (!is.null(map[[model_name]])) map[[model_name]] else default
+}
+
+# -------- Fill palettes (boxes & legends) --------
+# LR (binary): edit these two
+lr_levels  <- c("0","1")
+lr_palette <- c("0" = "#fc8d59",  # 0 -> grey
+                "1" = "#91bfdb")  # 1 -> blue
+
+# OLR/BR: 4-level palette (edit as you like)
+olr_levels  <- c("Low","Medium","High","Unknown")
+olr_palette <- c("Low"     = "#e7e1ef",  # green
+                 "Medium"  = "#c994c7",  # orange
+                 "High"    = "#dd1c77")  # grey
+
+# ============================================================
+# 6) Helpers
+# ============================================================
+clean_terms <- function(x) {
+  x <- gsub("`", "", x)
+  x <- gsub("^I\\((.+)\\)$", "\\1", x)                  # I(x^2) -> x^2
+  x <- gsub("^(?:scale|log|sqrt)\\((.+)\\)$", "\\1", x) # scale(x) -> x
+  x <- gsub(":.*$", "", x)                              # x:y -> x
+  x <- gsub("\\^.*$", "", x)                            # x^2 -> x
+  x
+}
+
+vars_in_data <- function(vars, data) {
+  if (!is.character(vars)) {
+    if (!is.null(names(vars))) {
+      vars <- names(vars)[(as.numeric(vars) != 0) & !is.na(as.numeric(vars))]
+    } else vars <- character(0)
+  }
+  intersect(vars, names(data))
+}
+
+pretty_or_raw <- function(x, map) {
+  if (length(map) == 0) return(x)
+  out <- x; m <- names(map); hit <- match(x, m)
+  out[!is.na(hit)] <- map[hit[!is.na(hit)]]
+  out
+}
+
+ensure_factor_levels <- function(x, levels_vec) factor(as.character(x), levels = levels_vec)
+
+# ============================================================
+# 7) Get variable lists from models
+#     (If you already have *\*_vars* vectors defined, comment this section out.)
+# ============================================================
+## LOGISTIC REG (from best formula)
+con_lr_vars   <- clean_terms(attr(terms(as.formula(con_result$best_formula)), "term.labels"))
+oak_lr_vars   <- clean_terms(attr(terms(as.formula(oak_result$best_formula)), "term.labels"))
+shrub_lr_vars <- clean_terms(attr(terms(as.formula(shr_result$best_formula)), "term.labels"))
+
+## ORDINAL LOGISTIC (non-zero coefficients)
+nz_terms <- function(glmnet_fit, whichLambda) {
+  M  <- as.matrix(coef(glmnet_fit, whichLambda = whichLambda))
+  nm <- rownames(M)
+  keep <- nm[rowSums(M != 0) > 0]
+  setdiff(keep, "(Intercept)")
+}
+con_OLR_vars   <- clean_terms(nz_terms(con_OLR_model$fit,  which.min(con_OLR_model$misclass)))
+oak_OLR_vars   <- clean_terms(nz_terms(oak_OLR_model$fit,  which.min(oak_OLR_model$misclass)))
+shrub_OLR_vars <- best_row
+
+
+# ============================================================
+# 8) Long-data builder (robust recoding)
+# ============================================================
+make_panel_df <- function(data, var_names, model_label,
+                          response_col, response_type,
+                          pretty_map_vec = character(0)) {
+
+  if (is.null(data) || !is.data.frame(data)) {
+    return(data.frame(Variable=character(0), Value=numeric(0),
+                      Model=character(0), Response=character(0)))
+  }
+
+  v <- vars_in_data(var_names, data)
+  if (length(v) == 0) {
+    return(data.frame(Variable=character(0), Value=numeric(0),
+                      Model=character(0), Response=character(0)))
+  }
+
+  # handle "succuess" vs "success"
+  resp_col <- response_col
+  if (!resp_col %in% names(data)) {
+    alt <- if (identical(response_col, "succuess")) "success" else "succuess"
+    if (alt %in% names(data)) resp_col <- alt
+  }
+
+  # Build long
+  tmp  <- data[, v, drop = FALSE]
+  long <- stack(tmp)                    # columns -> rows
+  names(long) <- c("Value","Variable")
+  # ensure numeric Value
+  if (!is.numeric(long$Value)) {
+    long$Value <- suppressWarnings(as.numeric(as.character(long$Value)))
+  }
+  # pretty names for variables
+  long$Variable <- pretty_or_raw(as.character(long$Variable), pretty_map_vec)
+  long$Model    <- model_label
+
+  # Response
+  if (!resp_col %in% names(data)) {
+    long$Response <- factor("Unknown")
+    return(long)
+  }
+  raw <- data[[resp_col]]
+
+  if (response_type == "binary") {
+    if (is.logical(raw)) raw <- ifelse(raw, "1", "0")
+    if (is.numeric(raw)) raw <- as.character(raw)
+    s <- as.character(raw)
+    s <- ifelse(s %in% c("1","true","yes"), "1",
+         ifelse(s %in% c("0","false","no"), "0", NA))
+    Resp <- factor(s, levels = lr_levels)
+
+  } else if (response_type == "ordinal") {
+    # robust mapper for Low/Medium/High, numeric or string
+    if (is.numeric(raw) || is.integer(raw)) {
+      ux <- sort(unique(raw[!is.na(raw)]))
+      if (all(ux %in% c(1,2,3))) {
+        Resp <- factor(raw, levels = c(1,2,3), labels = c("Low","Medium","High"))
+      } else if (all(ux %in% c(0,1,2))) {
+        Resp <- factor(raw, levels = c(0,1,2), labels = c("Low","Medium","High"))
+      } else {
+        s <- tolower(trimws(as.character(raw)))
+        s <- ifelse(s %in% c("low","l","lo","1"), "Low",
+             ifelse(s %in% c("medium","med","m","mid","moderate","2"), "Medium",
+             ifelse(s %in% c("high","h","hi","3"), "High", NA)))
+        Resp <- factor(s, levels = c("Low","Medium","High"))
+      }
+    } else {
+      s <- tolower(trimws(as.character(raw)))
+      s <- ifelse(s %in% c("low","l","lo","1"), "Low",
+           ifelse(s %in% c("medium","med","m","mid","moderate","2"), "Medium",
+           ifelse(s %in% c("high","h","hi","3"), "High", NA)))
+      Resp <- factor(s, levels = c("Low","Medium","High"))
+    }
+    # add Unknown for NAs to keep the 4-color legend if present
+    Resp <- as.character(Resp)
+    Resp[is.na(Resp)] <- "Unknown"
+    Resp <- factor(Resp, levels = olr_levels)
+
+  } else {
+    stop("Unknown response_type: ", response_type)
+  }
+
+  # recycle response per variable
+  long$Response <- rep(Resp, times = length(v))
+  long
+}
+
+# ============================================================
+# 9) Build long data for the SIX panels
+#     (LR top row; OLR bottom row, incl. SHRUB OLR)
+# ============================================================
+df1 <- make_panel_df(df_conLR,  con_lr_vars,   "Conifer — Logistic Regression",   resp_conLR,  "binary",   pretty_map)
+df2 <- make_panel_df(df_oakLR,  oak_lr_vars,   "Oak — Logistic Regression",       resp_oakLR,  "binary",   pretty_map)
+df3 <- make_panel_df(df_shrLR,  shrub_lr_vars, "Shrub — Logistic Regression",     resp_shrLR,  "binary",   pretty_map)
+
+df4 <- make_panel_df(df_conOLR, con_OLR_vars,  "Conifer — Ordinal Logistic Reg.", resp_conOLR, "ordinal",  pretty_map)
+df5 <- make_panel_df(df_oakOLR, oak_OLR_vars,  "Oak — Ordinal Logistic Reg.",     resp_oakOLR, "ordinal",  pretty_map)
+df6 <- make_panel_df(df_shrOLR, shrub_OLR_vars,"Shrub — Ordinal Logistic Reg.",   resp_shrOLR, "ordinal",  pretty_map)
+
+plot_df <- rbind(df1, df2, df3, df4, df5, df6)
+
+# Fixed model order (LR on top row)
+plot_df$Model <- factor(
+  plot_df$Model,
+  levels = c(
+    "Conifer — Logistic Regression",
+    "Oak — Logistic Regression",
+    "Shrub — Logistic Regression",
+    "Conifer — Ordinal Logistic Reg.",
+    "Oak — Ordinal Logistic Reg.",
+    "Shrub — Ordinal Logistic Reg."
+  )
+)
+
+# ============================================================
+# 10) Force label wrapping *in the data* (bullet-proof)
+#     ↓ Lower this to wrap more (e.g., 12 → 9).
+# ============================================================
+wrap_width_global <- 12  # <-- tweak me for more/less wrapping
+wrapfun <- function(s) paste(strwrap(s, width = wrap_width_global), collapse = "\n")
+lab_wrapped <- vapply(as.character(plot_df$Variable), wrapfun, character(1))
+plot_df$Variable <- factor(lab_wrapped, levels = unique(lab_wrapped))
+
+# ============================================================
+# 11) Mini-plot for a single variable (palette + separators)
+# ============================================================
+make_var_panel <- function(df_all, model_name, var_name, lims = NULL) {
+  d <- df_all[df_all$Model == model_name & df_all$Variable == var_name, , drop = FALSE]
+
+  if (is.null(lims)) {
+    rng <- range(d$Value, na.rm = TRUE)
+    if (!is.finite(rng[1]) || !is.finite(rng[2])) rng <- c(0, 1)
+    pad <- 0.04 * diff(rng); if (!is.finite(pad) || pad == 0) pad <- 0.05
+    lims <- c(rng[1] - pad, rng[2] + pad)
+  }
+
+  is_lr <- model_name %in% c(
+    "Conifer — Logistic Regression",
+    "Oak — Logistic Regression",
+    "Shrub — Logistic Regression"
+  )
+
+  ggplot(d, aes(x = Response, y = Value, fill = Response)) +
+    geom_boxplot(outlier.alpha = 0.25, width = 0.58,
+                 position = position_dodge2(preserve = "single")) +
+    scale_y_continuous(limits = lims, expand = expansion(mult = c(0, 0.05))) +
+    (if (is_lr)
+       scale_fill_manual(values = lr_palette, breaks = lr_levels, drop = FALSE)
+     else
+       scale_fill_manual(values = olr_palette, breaks = olr_levels, drop = FALSE)) +
+    labs(title = NULL, x = var_name, y = NULL) +
+    theme_minimal(base_size = 9) +
+    theme(
+      axis.text.x       = element_blank(),
+      axis.ticks.x      = element_blank(),
+      axis.title.x      = element_text(size = 7.2, face = "bold",
+                                       color = "black", lineheight = 0.98,
+                                       margin = margin(t = 4)),
+      axis.text.y       = element_text(size = 6, color = "grey35"),
+      panel.grid.major  = element_blank(),
+      panel.grid.minor  = element_blank(),
+      panel.background  = element_rect(fill = "white", color = NA),
+      panel.border      = element_rect(color = "grey85", fill = NA, linewidth = 0.5),
+      legend.position   = "none",
+      plot.margin       = margin(2, 2, 12, 2)
+    )
+}
+# ============================================================
+# 12) Model card: full-bleed header + ONE ROW of variables
+# ============================================================
+build_model_block <- function(df_all, model_name,
+                              header_fill_map,
+                              header_height   = 0.11,
+                              content_padding = margin(8, 10, 10, 10)) {
+
+  present <- unique(as.character(df_all$Variable[df_all$Model == model_name]))
+  if (length(present) == 0) present <- "(none)"
+  n_vars <- length(present)
+
+  # Build each mini-panel
+  panels <- vector("list", n_vars)
+  for (i in seq_len(n_vars)) {
+    panels[[i]] <- make_var_panel(df_all, model_name, present[i], lims = NULL)
+  }
+
+  # Single row of variables
+  inner_grid <- cowplot::plot_grid(plotlist = panels, ncol = max(1L, n_vars), align = "hv")
+
+  # Full-bleed grey header
+  header_fill <- get_header_fill(model_name, header_fill_map, default = "#e6e6e6")
+  header <- cowplot::ggdraw() +
+    theme(plot.background = element_rect(fill = header_fill, colour = NA),
+          plot.margin     = margin(0, 0, 0, 0)) +
+    cowplot::draw_label(model_name, x = 0.5, y = 0.5,
+                        hjust = 0.5, vjust = 0.5,
+                        fontface = "bold", size = 11, colour = "black")
+
+  content <- cowplot::ggdraw(inner_grid) +
+    theme(plot.margin = content_padding)
+
+  card <- cowplot::plot_grid(header, content, ncol = 1,
+                             rel_heights = c(header_height, 1), align = "v")
+
+  cowplot::ggdraw(card) +
+    theme(
+      plot.background = element_rect(colour = "grey45", fill = "white", linewidth = 0.9),
+      plot.margin     = margin(0, 0, 0, 0)
+    )
+}
+
+# ============================================================
+# 13) Build the six model cards
+# ============================================================
+p_conLR  <- build_model_block(plot_df, "Conifer — Logistic Regression",   header_fill_map)
+p_oakLR  <- build_model_block(plot_df, "Oak — Logistic Regression",       header_fill_map)
+p_shrLR  <- build_model_block(plot_df, "Shrub — Logistic Regression",     header_fill_map)
+
+p_conOLR <- build_model_block(plot_df, "Conifer — Ordinal Logistic Reg.", header_fill_map)
+p_oakOLR <- build_model_block(plot_df, "Oak — Ordinal Logistic Reg.",     header_fill_map)
+p_shrOLR <- build_model_block(plot_df, "Shrub — Ordinal Logistic Reg.",   header_fill_map)
+
+# ============================================================
+# 14) Legends (as grobs, no artifacts) + layout with gutters
+# ============================================================
+extract_fill_legend <- function(levels, palette, title = "Response") {
+  df <- data.frame(Response = factor(levels, levels = levels))
+  p  <- ggplot(df, aes(1, 1, fill = Response)) +
+    geom_tile() +
+    guides(x = "none", y = "none") +
+    scale_fill_manual(values = palette, breaks = levels, drop = FALSE) +
+    labs(fill = title) +
+    theme_void(base_size = 10) +
+    theme(legend.position = "right")
+  cowplot::get_legend(p)
+}
+
+leg_lr_grob  <- extract_fill_legend(lr_levels,  lr_palette,  title = "Response")
+leg_olr_grob <- extract_fill_legend(olr_levels, olr_palette, title = "Response")
+
+# Gutters (spacers)
+spacer_h <- cowplot::ggdraw()
+spacer_v <- cowplot::ggdraw()
+h_gap <- 0.06   # horizontal space between cards
+v_gap <- 0.06   # vertical space between rows
+
+top_row <- cowplot::plot_grid(
+  p_conLR, spacer_h, p_oakLR, spacer_h, p_shrLR,
+  ncol = 5, rel_widths = c(1, h_gap, 1, h_gap, 1), align = "hv"
+)
+
+bottom_row <- cowplot::plot_grid(
+  p_conOLR, spacer_h, p_oakOLR, spacer_h, p_shrOLR,
+  ncol = 5, rel_widths = c(1, h_gap, 1, h_gap, 1), align = "hv"
+)
+
+rows_with_gap <- cowplot::plot_grid(
+  top_row, spacer_v, bottom_row,
+  ncol = 1, rel_heights = c(1, v_gap, 1)
+)
+
+legend_col <- cowplot::plot_grid(
+  cowplot::ggdraw(leg_lr_grob), spacer_v, cowplot::ggdraw(leg_olr_grob),
+  ncol = 1, rel_heights = c(0.5, v_gap, 0.5)
+)
+
+# Final 2-column layout
+p_final <- cowplot::plot_grid(
+  rows_with_gap,
+  legend_col,
+  ncol = 2,
+  rel_widths = c(0.86, 0.14)
+)
+
+#p_final
+
+```
+
+```{r boxplot-plot, echo = FALSE, fig.height=6, fig.width=10}
+plot(p_final)
+```
+
+
+
+## Park-wide Mapping
+
+Model Accuracy and Misclassification
+
+Figure 6. Model accuracy (bar plot with confidence intervals).
+
+Table 3. Model accuracy statistics (overall, per class, Kappa/AUC).
+
+Case study of Foresta misclassification.
+
+Figure 7. Misclassification example (map zoom).
+
+Final mapped distributions of conifer, oak, shrub regeneration.
+
+```{r park-wide-pred-setup, echo = FALSE, eval = FALSE}
+## ======================== SETUP ========================
+raster_dir   <- "G:\\REGEN\\Plot_Level_Products\\PatchMetrics_Unpacked"
+sentinel_dir <- "G:/REGEN/Park_Level_Datasets/Sentinel"
+ref_rast     <- rast(file.path(raster_dir, "aniso_TAO.tif"))
+
+## ======================== ALIASES ======================
+alias_vars <- function(vars) {
+  # Structural alias
+  vars <- sub("^p25_", "zq25_", vars)
+
+  # Sentinel alias mapping
+  sent_map <- c(
+    ndvis = "june_ndvi.tif",
+    ndviw = "oct_ndvi.tif",
+    ndvi  = "seasDiff_ndvi.tif",
+    ndirs = "june_ndir.tif",
+    ndirw = "oct_ndir.tif",
+    ndir  = "seasDiff_ndir.tif"
+  )
+
+  list(vars = vars, sent_map = sent_map)
+}
+
+## =================== STACK BUILDER =====================
+stack_from_model <- function(model) {
+  # Extract variables from formula (drop intercept)
+  vars <- all.vars(formula(model))
+  vars <- setdiff(vars, "(Intercept)")
+  vars <- setdiff(vars, "success")
+  vars <- unique(vars)
+  if (length(vars) == 0) stop("No variables found in model formula")
+  
+  #vars = vars[2:length(vars)]
+  a <- alias_vars(vars)
+
+  # File paths (vectorized)
+  files <- vapply(a$vars, function(v) {
+    if (v %in% names(a$sent_map)) {
+      file.path(sentinel_dir, a$sent_map[v])
+    } else {
+      file.path(raster_dir, paste0(v, ".tif"))
+    }
+  }, FUN.VALUE = character(1))
+
+  # Load & align one by one
+  aligned <- lapply(seq_along(files), function(ii) {
+    message("Aligning layer ", ii, ": ", files[ii])
+    r <- terra::rast(files[ii])
+    if (!terra::compareGeom(r, ref_rast, stopOnError = FALSE)) {
+      r <- terra::project(r, ref_rast)
+      r <- terra::resample(r, ref_rast, method = "bilinear")
+    }
+    names(r) <- vars[ii]
+    r
+  })
+
+  # Stack them together
+  rast(aligned)
+}
+
+## ====================== PREDICT ========================
+predict_from_model <- function(model, outfile = NULL, type = "response") {
+  s <- stack_from_model(model)
+  pr <- predict(s, model, type = type, na.rm = TRUE)
+  if (!is.null(outfile)) writeRaster(pr, outfile, overwrite = TRUE)
+  pr
+}
+
+## ================== RUN ALL 6 MODELS ===================
+## (assumes you already have: con_glm, oak_glm, shr_glm,
+##  con_OLR_model, oak_OLR_model, shr_OLR_model)
+
+models <- list(
+  #con_glm       = con_glm,
+  #oak_glm       = oak_glm
+  shrub_glm     = shr_glm
+)
+
+predictions <- list()
+binary_preds <- list()
+
+for (nm in names(models)) {
+  message("Predicting for: ", nm)
+  out_file_prob <- paste0(nm, "_prob.tif")
+  out_file_bin  <- paste0(nm, "_binary.tif")
+
+  # GLMs (binomial → probability surface)
+  pr <- predict_from_model(models[[nm]], outfile = out_file_prob, type = "response")
+ 
+  # Threshold at 0.5 → presence/absence (1/0)
+  pr_bin <- pr >= 0.8
+  pr_bin <- classify(pr_bin, cbind(NA, NA, NA)) # make sure NA stays NA
+  names(pr_bin) <- paste0(nm, "_binary")
+
+  # Save
+  writeRaster(pr_bin, sprintf("Park_Level_Products\\LogReg_Pred\\%s", out_file_bin), overwrite = TRUE)
+  writeRaster(pr, sprintf("Park_Level_Products\\LogReg_Pred\\%s", out_file_prob), overwrite = TRUE)
+
+  # Store in memory too
+  predictions[[nm]]   <- pr
+  binary_preds[[nm]]  <- pr_bin
+}
+```
+
+```{r ord-reg-mapping, echo = FALSE, eval = FALSE}
+
+## =================== STACK BUILDER (no conditionals) =====================
+stack_from_vars <- function(vars) {
+  a <- alias_vars(vars)                                   # expects $vars and $sent_map
+
+  files <- file.path(raster_dir, paste0(a$vars, ".tif"))
+  m <- match(a$vars, names(a$sent_map))
+  sel <- !is.na(m)
+  files[sel] <- file.path(sentinel_dir, unname(a$sent_map[m[sel]]))
+
+  rlist <- vector("list", length(files))
+  i <- 1
+  for (f in files) {
+    r <- rast(f)
+    r <- terra::project(r, ref_rast, method = "bilinear", align = TRUE)
+    r <- resample(r, ref_rast, method = "bilinear")
+    names(r) <- a$vars[i]
+    rlist[[i]] <- r
+    i <- i + 1
+  }
+  s <- rast(rlist)
+  names(s) <- vars
+  s
+}
+
+# predict_OLR(con_OLR_vars, conifer_ord_DF)
+
+pred_lists = list(0)
+
+
+  # 2) Scale training data (keep params)
+  scaleBounds <- scale(con_X_reduced)
+  mu   <- attr(scaleBounds, "scaled:center")
+  sg   <- attr(scaleBounds, "scaled:scale")
+  sg[is.na(sg) | sg == 0] <- 1
+
+## ====================== OLR PREDICT (ordinalNet) ======================
+predict_OLR <- function(vars, df, pres_rast) {
+  library(terra)
+  
+  vars <- vars[vars != "(Intercept)"]
+  vars <- unique(vars)
+  x <- as.matrix(df[, vars, drop = FALSE])
+  y <- df$success
+  if (!is.ordered(y)) y <- factor(y, ordered = TRUE)
+
+  # Scale training data
+  x_sc <- scale(x)
+  mu   <- attr(x_sc, "scaled:center")
+  sg   <- attr(x_sc, "scaled:scale")
+  sg[is.na(sg) | sg == 0] <- 1
+  
+  # Store training ranges for clipping
+  train_ranges <- apply(x, 2, range, na.rm = TRUE)
+
+  # **Use ordinalNetCV to find best lambda**
+  cv_fit <- ordinalNetCV(
+    x = x_sc, 
+    y = y,
+    family = "cumulative", 
+    link = "logit",
+    parallelTerms = TRUE, 
+    nonparallelTerms = TRUE,
+    alpha = 0.5, 
+    tuneMethod = "cvLoglik",
+    maxiterOut = 500, 
+    maxiterIn = 500,
+    standardize = FALSE
+  )
+  
+  # **Get the lambda index with the highest mean CV log-likelihood**
+  # Average the cvLoglik across folds for each lambda
+  mean_cvLoglik <- rowMeans(cv_fit$cvLoglik, na.rm = TRUE)
+  best_lambda_idx <- which.max(mean_cvLoglik)
+  best_lambda <- cv_fit$lambdaVals[best_lambda_idx]
+  
+  cat("Best lambda index:", best_lambda_idx, "\n")
+  cat("Best lambda value:", best_lambda, "\n")
+  
+  # **Refit with the best lambda**
+  olr <- ordinalNet(
+    x = x_sc, 
+    y = y,
+    family = "cumulative", 
+    link = "logit",
+    parallelTerms = TRUE, 
+    nonparallelTerms = TRUE,
+    alpha = 0.5,
+    lambdaVals = best_lambda,
+    maxiterOut = 500, 
+    maxiterIn = 500,
+    standardize = FALSE
+  )
+
+  # Raster covariates
+  s <- stack_from_vars(vars)
+  s <- s[[vars]]
+
+  # Local copies for predictor functions
+  mu_local     <- mu
+  sg_local     <- sg
+  vars_local   <- vars
+  ranges_local <- train_ranges
+  fit_local    <- olr
+
+  # Clip then scale
+  pr_fun_class <- function(model, d, ...) {
+    z <- as.matrix(d[, vars_local, drop = FALSE])
+    for (j in seq_along(vars_local)) {
+      z[, j] <- pmin(pmax(z[, j], ranges_local[1, j]), ranges_local[2, j])
+      z[, j] <- (z[, j] - mu_local[j]) / sg_local[j]
+    }
+    as.integer(predict(model, newx = z, type = "class"))
+  }
+
+  pr_fun_probs <- function(model, d, ...) {
+    z <- as.matrix(d[, vars_local, drop = FALSE])
+    for (j in seq_along(vars_local)) {
+      z[, j] <- pmin(pmax(z[, j], ranges_local[1, j]), ranges_local[2, j])
+      z[, j] <- (z[, j] - mu_local[j]) / sg_local[j]
+    }
+    predict(model, newx = z, type = "response")
+  }
+
+  # Predict
+  cls_r <- terra::predict(
+    s, model = olr, fun = pr_fun_class, na.rm = TRUE,
+    filename = "olr_pred_classes.tif", overwrite = TRUE,
+    wopt = list(datatype = "INT1U")
+  )
+  names(cls_r) <- "olr_class"
+
+  prob_r <- terra::predict(
+    s, model = olr, fun = pr_fun_probs, na.rm = TRUE,
+    filename = "olr_pred_probs.tif", overwrite = TRUE
+  )
+
+  levs <- levels(y)
+  if (!is.null(levs) && nlyr(prob_r) == length(levs)) {
+    names(prob_r) <- paste0("prob_", make.names(levs))
+  }
+
+  list(
+    model        = olr,
+    cv_fit       = cv_fit,
+    best_lambda  = best_lambda,
+    class_raster = cls_r,
+    prob_raster  = prob_r,
+    center       = mu,
+    scale        = sg,
+    train_ranges = train_ranges
+  )
+}
+
+  
+## ================== RUN OLR MODELS (no conditionals) =====================
+olr_models <- list(
+  con_OLR   = list(df = conifer_ord_DF,   vars = con_OLR_vars,   glm_name = "con_glm",   pres_rast = binary_preds$con_glm),
+  oak_OLR   = list(df = oak_OLR_DF,   vars = oak_OLR_vars,   glm_name = "oak_glm",   pres_rast = binary_preds$oak_glm),
+  shrub_OLR = list(df = shrub_OLR_DF,   vars = shrub_OLR_vars, glm_name = "shrub_glm", pres_rast = binary_preds$shrub_glm)
+)
+
+olr_preds <- list()
+k <- 1
+for (k in seq_along(olr_models)) {
+  nm <- names(olr_models)[k]
+  message("Running OLR: ", nm)
+  olr_preds[[nm]] <- predict_OLR(
+    df          = olr_models[[k]]$df,   # pass an "ordinalNet" object
+    vars        = olr_models[[k]]$vars,
+    pres_rast   = olr_models[[k]]$pres_rast
+  )
+}
+
+
+
+writeRaster(olr_preds$con_OLR$class_raster, "Park_Level_Products\\OrdReg_Pred\\Con_OLR_Class1.tif", overwrite=TRUE)
+writeRaster(olr_preds$oak_OLR$class_raster, "Park_Level_Products\\OrdReg_Pred\\Oak_OLR_Class1.tif", overwrite=TRUE)
+writeRaster(olr_preds$shrub_OLR$class_raster, "Park_Level_Products\\OrdReg_Pred\\Shrub_OLR_Class1.tif",overwrite=TRUE)
+
+plot(olr_preds$con_OLR$class_raster)
+
+```
+
+
+Figure 8. Park-wide regeneration maps
+
+## Spatial Configuration of Post-Fire Vegetation
+
+
+
+
+
+
+# Appendix
+
+## Model Test Statistics:
+
+```{r variable-table, echo = FALSE, warning=FALSE}
+
+## -----------------------------
+## Columns (create directly)
+## -----------------------------
+vars_table <- data.frame(
+  VegType   = c("Conifer","Oak","Shrub",  "Conifer","Oak","Shrub",  "Shrub"),
+  ModelType = c(
+    "Ordinal Logistic Regression","Ordinal Logistic Regression","Ordinal Logistic Regression",
+    "Logistic Regression","Logistic Regression","Logistic Regression",
+    "Beta Regression"
+  ),
+  Variables = NA_character_,
+  stringsAsFactors = FALSE
+)
+
+num_cols <- c("Accuracy","Kappa",
+              "Sens_Low","Spec_Low","Sens_Medium","Spec_Medium","Sens_High","Spec_High",
+              "Sensitivity","Specificity","Precision","Recall","F1","RMSE","MAE")
+
+for (cc in num_cols) vars_table[[cc]] <- NA_real_
+
+## -----------------------------
+## OLR: Conifer
+## -----------------------------
+i <- which(vars_table$VegType == "Conifer" & vars_table$ModelType == "Ordinal Logistic Regression")
+if (length(i)) {
+  vars_table$Accuracy[i]     <- unname(conCM$overall["Accuracy"])
+  vars_table$Kappa[i]        <- unname(conCM$overall["Kappa"])
+  rn <- rownames(conCM$byClass)
+  sc <- which(colnames(conCM$byClass) == "Sensitivity")
+  pc <- which(colnames(conCM$byClass) == "Specificity")
+  il <- which(grepl("Class:\\s*Low$", rn))
+  im <- which(grepl("Class:\\s*Medium$", rn))
+  ih <- which(grepl("Class:\\s*High$", rn))
+  if (length(il)) { vars_table$Sens_Low[i]    <- conCM$byClass[il, sc]; vars_table$Spec_Low[i]    <- conCM$byClass[il, pc] }
+  if (length(im)) { vars_table$Sens_Medium[i] <- conCM$byClass[im, sc]; vars_table$Spec_Medium[i] <- conCM$byClass[im, pc] }
+  if (length(ih)) { vars_table$Sens_High[i]   <- conCM$byClass[ih, sc]; vars_table$Spec_High[i]   <- conCM$byClass[ih, pc] }
+}
+
+## OLR: Oak
+i <- which(vars_table$VegType == "Oak" & vars_table$ModelType == "Ordinal Logistic Regression")
+if (length(i)) {
+  vars_table$Accuracy[i]     <- unname(oakCM$overall["Accuracy"])
+  vars_table$Kappa[i]        <- unname(oakCM$overall["Kappa"])
+  rn <- rownames(oakCM$byClass)
+  sc <- which(colnames(oakCM$byClass) == "Sensitivity")
+  pc <- which(colnames(oakCM$byClass) == "Specificity")
+  il <- which(grepl("Class:\\s*Low$", rn))
+  im <- which(grepl("Class:\\s*Medium$", rn))
+  ih <- which(grepl("Class:\\s*High$", rn))
+  if (length(il)) { vars_table$Sens_Low[i]    <- oakCM$byClass[il, sc]; vars_table$Spec_Low[i]    <- oakCM$byClass[il, pc] }
+  if (length(im)) { vars_table$Sens_Medium[i] <- oakCM$byClass[im, sc]; vars_table$Spec_Medium[i] <- oakCM$byClass[im, pc] }
+  if (length(ih)) { vars_table$Sens_High[i]   <- oakCM$byClass[ih, sc]; vars_table$Spec_High[i]   <- oakCM$byClass[ih, pc] }
+}
+
+## OLR: Shrub
+i <- which(vars_table$VegType == "Shrub" & vars_table$ModelType == "Ordinal Logistic Regression")
+if (length(i)) {
+  vars_table$Accuracy[i]     <- unname(shrubCM$overall["Accuracy"])
+  vars_table$Kappa[i]        <- unname(shrubCM$overall["Kappa"])
+  rn <- rownames(shrubCM$byClass)
+  sc <- which(colnames(shrubCM$byClass) == "Sensitivity")
+  pc <- which(colnames(shrubCM$byClass) == "Specificity")
+  il <- which(grepl("Class:\\s*Low$", rn))
+  im <- which(grepl("Class:\\s*Medium$", rn))
+  ih <- which(grepl("Class:\\s*High$", rn))
+  if (length(il)) { vars_table$Sens_Low[i]    <- shrubCM$byClass[il, sc]; vars_table$Spec_Low[i]    <- shrubCM$byClass[il, pc] }
+  if (length(im)) { vars_table$Sens_Medium[i] <- shrubCM$byClass[im, sc]; vars_table$Spec_Medium[i] <- shrubCM$byClass[im, pc] }
+  if (length(ih)) { vars_table$Sens_High[i]   <- shrubCM$byClass[ih, sc]; vars_table$Spec_High[i]   <- shrubCM$byClass[ih, pc] }
+}
+
+## -----------------------------
+## LR: Conifer
+## -----------------------------
+i <- which(vars_table$VegType == "Conifer" & vars_table$ModelType == "Logistic Regression")
+if (length(i)) {
+  cm <- conLR_res$confusion
+  vars_table$Accuracy[i]    <- unname(cm$overall["Accuracy"])
+  vars_table$Kappa[i]       <- unname(cm$overall["Kappa"])
+  vars_table$Sensitivity[i] <- unname(cm$byClass["Sensitivity"])
+  vars_table$Specificity[i] <- unname(cm$byClass["Specificity"])
+  vars_table$Precision[i]   <- conLR_res$precision
+  vars_table$Recall[i]      <- conLR_res$recall
+  vars_table$F1[i]          <- conLR_res$fscore
+}
+
+## LR: Oak
+i <- which(vars_table$VegType == "Oak" & vars_table$ModelType == "Logistic Regression")
+if (length(i)) {
+  cm <- oakLR_res$confusion
+  vars_table$Accuracy[i]    <- unname(cm$overall["Accuracy"])
+  vars_table$Kappa[i]       <- unname(cm$overall["Kappa"])
+  vars_table$Sensitivity[i] <- unname(cm$byClass["Sensitivity"])
+  vars_table$Specificity[i] <- unname(cm$byClass["Specificity"])
+  vars_table$Precision[i]   <- oakLR_res$precision
+  vars_table$Recall[i]      <- oakLR_res$recall
+  vars_table$F1[i]          <- oakLR_res$fscore
+}
+
+## LR: Shrub
+i_shrub_lr <- which(vars_table$VegType == "Shrub" & vars_table$ModelType == "Logistic Regression")
+if (length(i_shrub_lr)) {
+  cm <- shrubLR_res$confusion
+  vars_table$Accuracy[i_shrub_lr]    <- unname(cm$overall["Accuracy"])
+  vars_table$Kappa[i_shrub_lr]       <- unname(cm$overall["Kappa"])
+  vars_table$Sensitivity[i_shrub_lr] <- unname(cm$byClass["Sensitivity"])
+  vars_table$Specificity[i_shrub_lr] <- unname(cm$byClass["Specificity"])
+  vars_table$Precision[i_shrub_lr]   <- shrubLR_res$precision
+  vars_table$Recall[i_shrub_lr]      <- shrubLR_res$recall
+  vars_table$F1[i_shrub_lr]          <- shrubLR_res$fscore
+}
+
+## -----------------------------
+## Beta Regression row (Shrub)
+## -----------------------------
+i_beta <- which(vars_table$VegType == "Shrub" & vars_table$ModelType == "Beta Regression")
+if (length(i_beta)) {
+  # keep Variables text in sync with br_vars if you want
+  if (exists("br_vars")) {
+    tmp <- as.character(br_vars)
+    tmp <- tmp[tmp != "(Intercept)" & nzchar(tmp)]
+    vars_table$Variables[i_beta] <- paste(unique(tmp), collapse = ", ")
+  }
+  vars_table$Accuracy[i_beta] <- beta_acc   # show beta "accuracy" on the Beta row too
+  vars_table$RMSE[i_beta]     <- mean_rmse
+  vars_table$MAE[i_beta]      <- mean_mae
+}
+
+## Also overwrite the LR 'accuracy row' with beta accuracy and add RMSE/MAE there
+if (length(i_shrub_lr)) {
+  vars_table$Accuracy[i_shrub_lr] <- beta_acc   # overwrite LR accuracy with beta_acc
+  vars_table$RMSE[i_shrub_lr]     <- mean_rmse
+  vars_table$MAE[i_shrub_lr]      <- mean_mae
+}
+
+## Done
+tab <- kable(vars_table,
+             caption = "Model Preformance",
+             row.names = FALSE)
+tab
+
+```
+
+## Complete Predictions
+```{r master-table, echo=FALSE, results='asis', warning=FALSE}
+library(knitr)
+
+# --- Column order ---
+cols <- c(
+  "plotID", "x", "y",
+  # Conifer
+  "regencount", "con_obsClass", "con_logClass", "con_predClass",
+  # Oak
+  "oakcount", "oak_obsClass", "oak_logClass", "oak_predClass",
+  # Shrub
+  "shrub_percentages", "shrub_obsClass", "shrub_logClass",
+  "shrub_predClass", "shrub_predPerc", "shrub_PredDiff"
+)
+
+keep <- cols[cols %in% names(master_pred)]
+pretty_master <- master_pred[, keep, drop = FALSE]
+
+# --- Pretty headers (short names) ---
+pretty_names <- c(
+  "Plot ID", "X", "Y",
+  # Conifer
+  "Count", "Observed Class", "LR Predicted Class", "OLR Predicted Class",
+  # Oak
+  "Count", "Observed Class", "LR Predicted Class", "OLR Predicted Class",
+  # Shrub
+  "(%)", "Observed Class", "LR Predicted Class", "OLR Predicted Class",
+  "Predicted (%)", "Prediction Diff"
+)
+
+pretty_names <- pretty_names[match(keep, cols)]
+names(pretty_master) <- pretty_names
+
+# --- Group widths by position ---
+w_lead <- 3   # Plot ID, X, Y
+w_con  <- 4   # Conifer group
+w_oak  <- 4   # Oak group
+w_shr  <- 6   # Shrub group
+
+header_vec <- c(" " = w_lead,
+                "Conifer" = w_con,
+                "Oak"     = w_oak,
+                "Shrub"   = w_shr)
+
+# --- Build table ---
+tab <- kable(pretty_master,
+             caption = "All Predictions Across Models",
+             row.names = FALSE)
+
+# tab <- kable_styling(tab,
+#                      bootstrap_options = c("striped", "hover", "condensed"),
+#                      full_width = FALSE, font_size = 11)
+# 
+# tab <- add_header_above(tab, header_vec, bold = TRUE, line = TRUE)
+# 
+# # # --- Add vertical separators between groups ---
+# # con_start   <- w_lead + 1
+# # oak_start   <- w_lead + w_con + 1
+# # shrub_start <- w_lead + w_con + w_oak + 1
+# # 
+# # sep_css <- "border-left: 2px solid #bbb;"  # light grey border
+# # 
+# # tab <- column_spec(tab, c(oak_start, shrub_start), extra_css = sep_css)
+
+#tab
+tab
+```
+
+
+
+## Statistical Modeling
+
+### Presence-Absence Modeling
+
+We used binomial logistic regression to model the presence-absence of three vegetation types: conifer, oak, and shrub. Candidate predictor variables were derived from airborne LiDAR data and included structural complexity metrics (e.g., canopy height variability, vertical complexity, sphericity) and canopy geometry features (e.g., planarity, linearity). We also incorporated seasonal vegetation indices (NDVI, NDIR) derived from Sentinel-2 imagery to capture phenological patterns. 
+
+Variables were tested for collinearity using Pearson correlation coefficients, and one variable from each pair with |r| > 0.6 was removed to reduce multicollinearity. Model selection followed a stepwise approach using Akaike Information Criterion (AIC), retaining variables that significantly improved model fit (p < 0.05). Final models were evaluated using Area Under the Receiver Operating Characteristic Curve (AUC). Probability surfaces were converted to binary presence-absence maps using optimized thresholds (conifer: 0.9, oak: 0.85, shrub: 0.8) that maximized classification accuracy.
+
+### Regeneration Density Modeling
+
+For locations where each vegetation type was present, we modeled regeneration density as an ordinal response using cumulative link models with a logit link function. Regeneration densities were classified into three ordered categories based on field-measured seedling counts (AMOUNTS TABLE). These thresholds were selected to create approximately balanced classes while reflecting ecologically meaningful differences in regeneration potential.
+
+Predictor variables included LiDAR-derived structural metrics characterizing three-dimensional forest structure and complexity. Key predictors retained in final models included sphericity (measuring structural uniformity), seasonal NDVI difference (capturing phenological variation), planarity at multiple height strata (85th-95th percentiles), elevation diversity (90th-99th percentile range), and mid-canopy directional metrics. Additional variables included interquartile range of upper canopy heights and seasonal spectral indices from Sentinel-2.
+
+We implemented penalized ordinal regression using elastic net regularization (α = 0.5) to handle potential multicollinearity among structural metrics and prevent overfitting (Wurm et al., 2017). The regularization parameter (λ) was selected via 5-fold cross-validation, testing 20 λ values and selecting the value that maximized cross-validated log-likelihood. Models included both parallel (proportional odds) and non-parallel terms to allow threshold-specific effects where warranted by the data structure.
+
+Predictor variables were standardized (mean = 0, SD = 1) prior to model fitting. For spatial prediction, landscape raster values were clipped to the training data range before scaling to prevent extrapolation beyond observed conditions. Final models used λ indices of 9 for all three vegetation types, retaining 5-8 non-zero predictors per model. Model performance was assessed using overall classification accuracy and class-specific accuracy, achieving 65.5% accuracy for oak and 72.2% accuracy for conifer regeneration predictions.
+
+All analyses were conducted in R version 4.3.0 (R Core Team, 2023) using the ordinalNet package (Wurm et al., 2017) for penalized ordinal regression, base glm() for binomial models, and terra (Hijmans, 2023) for spatial raster processing and predictions.
+
+### References
+
+Hijmans, R. J. (2023). terra: Spatial Data Analysis. R package version 1.7-39.
+
+R Core Team (2023). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria.
+
+Wurm, M. J., Rathouz, P. J., & Hanlon, B. M. (2017). Regularized ordinal regression and the ordinalNet R package. *Journal of Statistical Software*, 99(6), 1-42.
+
+
+
+
